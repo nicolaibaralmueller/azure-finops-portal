@@ -14,7 +14,7 @@ Report privately through GitHub's **[Private vulnerability reporting](https://do
 Security tab → **Report a vulnerability**. (Maintainers: enable this under
 Settings → Code security → *Private vulnerability reporting*.)
 
-If you can't use that channel, contact the maintainer at `nbm@profmail.dk`.
+If you can't use that channel, contact the maintainer at `33453919+nicolaibaralmueller@users.noreply.github.com`.
 
 Please include:
 
