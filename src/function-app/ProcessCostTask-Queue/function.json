@@ -1,0 +1,11 @@
+{
+  "bindings": [
+    {
+      "name": "Task",
+      "type": "queueTrigger",
+      "direction": "in",
+      "queueName": "cost-tasks",
+      "connection": "AzureWebJobsStorage"
+    }
+  ]
+}

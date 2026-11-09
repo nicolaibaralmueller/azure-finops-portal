@@ -1,0 +1,31 @@
+{
+  "version": "2.0",
+  "//functionTimeout": "Explicit rather than relying on the implicit Dedicated-plan default. Kept at 30 minutes ON PURPOSE: the PowerShell worker runs a limited number of invocations at a time, so a timer that runs for an hour can starve the HTTP endpoints the portal calls. A run that needs longer than this is a bug to fix, not a ceiling to raise.",
+  "functionTimeout": "00:30:00",
+  "logging": {
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": true,
+        "excludedTypes": "Request"
+      }
+    }
+  },
+  "//extensions.queues": "The cost ingest's work queue (ProcessCostTask-Queue). batchSize 1 / newBatchThreshold 0: one task at a time — Cost Management's quota is per tenant, so parallel queries only buy more throttling, and one task leaves the worker's other slots to the portal's API. messageEncoding none: Add-QueueMessage (profile.ps1) writes plain JSON. visibilityTimeout: a task that throws is retried after a minute, at most maxDequeueCount times.",
+  "extensions": {
+    "queues": {
+      "batchSize": 1,
+      "newBatchThreshold": 0,
+      "maxPollingInterval": "00:00:10",
+      "visibilityTimeout": "00:01:00",
+      "maxDequeueCount": 5,
+      "messageEncoding": "none"
+    }
+  },
+  "managedDependency": {
+    "enabled": false
+  },
+  "extensionBundle": {
+    "id": "Microsoft.Azure.Functions.ExtensionBundle",
+    "version": "[4.*, 5.0.0)"
+  }
+}

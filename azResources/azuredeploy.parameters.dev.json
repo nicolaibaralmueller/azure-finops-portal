@@ -1,0 +1,50 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "appName": {
+    },
+    "environment": {
+      "value": "dev"
+    },
+    "logAnalyticsWorkspaceId": {
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/<RG>/providers/Microsoft.OperationalInsights/workspaces/<workspace>"
+    },
+    "authClientId": {
+      "value": "00000000-0000-0000-0000-000000000000"
+    },
+    "portalAllowedIpRanges": {
+      "value": ["<IP>/32"]
+    },
+    "portalPublicHostName": {
+      "value": "finops.contoso.com"
+    },
+    "frontDoorId": {
+      "value": "00000000-0000-0000-0000-000000000000"
+    },
+    "portalLanguage": {
+      "value": "en"
+    },
+    "portalTheme": {
+      "value": "azure-portal"
+    },
+    "aiProvider": {
+      "value": "openai"
+    },
+    "aiAuthMode": {
+      "value": "managedIdentity"
+    },
+    "aiEndpoint": {
+      "value": "https://<endpoint>.services.ai.azure.com/openai/v1"
+    },
+    "aiModel": {
+      "value": "gpt-finops"
+    },
+    "deployKeyVault": {
+      "value": false
+    },
+    "allocationTagKeys": {
+      "value": "Owner, Environment"
+    }
+  }
+}

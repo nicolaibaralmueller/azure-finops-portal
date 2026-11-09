@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FinOps Portal</title>
+    <!-- favicon.ico for Internet Explorer / IE mode and bookmarks (16, 32, 48 px); SVG for modern
+         browsers; a 180 px PNG for phones' home screens. Relative: the build is served from any path. -->
+    <link rel="icon" href="favicon.ico" sizes="any" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <style>
+      /* Print a page (e.g. a monthly statement) without the portal chrome, at full length. */
+      @media print {
+        [data-print-hide] { display: none !important; }
+        html, body, #root, #root * { overflow: visible !important; }
+        #root > div, #root > div > div { height: auto !important; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

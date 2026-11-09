@@ -1,0 +1,25 @@
+Setup/_setup-context.json
+
+# Web app build
+src/web-app/node_modules/
+src/web-app/dist/
+# Compiler output that must never land beside the sources (tsc -b writes build info to
+# node_modules/.tmp; these catch an older config or a stray `tsc` run)
+src/web-app/vite.config.js
+src/web-app/vite.config.d.ts
+src/web-app/*.tsbuildinfo
+
+# Local deployment parameter files (contain real subscription/tenant values)
+azResources/*.local.json
+azResources/*.tst.json
+# azuredeploy.parameters.dev.json and .prd.json ARE committed: examples with placeholder values only.
+# Put real values in a *.local.json copy, never in these two.
+docs/plans/
+
+# Themes: only the public ones are committed. Any other theme folder (e.g. your own branding)
+# stays in the local clone; it still builds and deploys from there.
+src/web-app/src/themes/*/
+!src/web-app/src/themes/azure-portal/
+
+# Deployment artifacts
+*.zip
