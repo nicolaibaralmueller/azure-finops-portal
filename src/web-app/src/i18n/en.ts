@@ -237,6 +237,7 @@ export const en = {
     usedLast: (days: number) => `Resources that used it — last ${days} days`,
     askWhich: (name: string) => `Which resources use ${name}, and is it the right size?`,
     noUsage: 'No usage data for this commitment yet. It appears after the nightly sync once Azure has amortized cost for it.',
+    costHidden: 'Azure reports no amount for the usage this commitment covers on this tenant, so the shares below are by usage (hours or units), and the covered amount is not shown.',
     idleWarn: (lastUsed: string | null) => `Nothing has used it in the last 7 days${lastUsed ? ` (last used ${lastUsed})` : ''}. Check whether its resources were resized, moved or deleted.`,
     resourcesUsing: (name: string) => `Resources using ${name}`,
     resource: 'Resource',
@@ -288,6 +289,14 @@ export const en = {
       `Within the period: daily cost fell on ${day} from about ${before} to about ${after}; it ended at ${end} for a whole period.`,
     shapeEnd: (end: string) => `Within the period: it ended at ${end} for a whole period.`,
     shapeResolved: 'That is back below the bar — the increase has already fallen back.',
+    shapeNow: (state: 'open' | 'decreasing' | 'resolved', level: string, asOf: string): string =>
+      `Now: ${level} per period over the last settled days to ${asOf}${state === 'resolved' ? ' — back to normal.' : state === 'decreasing' ? ' — falling.' : ' — still high.'}`,
+    basis: (n: number, week: boolean): string =>
+      `Compared with the average of the ${n} preceding ${week ? `7-day window${n === 1 ? '' : 's'}` : `month${n === 1 ? '' : 's'}`}${n > 2 ? ' (detection itself uses their median, so totals can differ slightly)' : ''}.`,
+    spread: (n: number, top: string): string =>
+      `The rise is spread over ${n} resources; the largest accounts for ${top}% of it.`,
+    spreadThin: 'No single resource caused it — look at the meters above and at subscription-level settings.',
+    meterOrResource: 'Meter / resource',
     isNew: 'new',
     unitPrice: (p: string) => `unit price ${p}`,
     usage: (p: string) => `usage ${p}`,
@@ -438,7 +447,8 @@ export const en = {
       resourceId: 'Resource ID', meter: 'Meter category', allocation: 'Allocation', typical: (c: string) => `Typical (${c})`,
       thisPeriod: (c: string) => `This period (${c})`, increase: (c: string) => `Increase (${c})`, increasePct: 'Increase %',
       newSpend: 'New spend', drove: 'What drove it', explanation: 'Explanation', explained: 'Explained by evidence', nextStep: 'Next step',
-      alreadyFell: 'Already fell back', endLevel: (c: string) => `Level at month end (${c})`,
+      alreadyFell: 'Already fell back', endLevel: (c: string) => `Level at period end (${c})`,
+      state: 'State', currentLevel: (c: string) => `Current level per period (${c})`, currentAsOf: 'Current level as of', fallPct: 'Fall %', fallSince: 'Falling since',
     },
     loading: 'Loading cost changes…',
     noPeriod: (month: boolean) => `No complete ${month ? 'month' : 'week'} has been analysed yet — findings appear once a period ends and the nightly run has processed it.`,
@@ -461,8 +471,46 @@ export const en = {
     newSpend: 'new spend',
     spread: 'spread across resources',
     alreadyFell: 'already fell back',
-    alreadyFellHint: 'The month total was higher, but the cost was back at a normal level when the month ended.',
-    endLevel: 'Level at month end',
+    alreadyFellHint: 'The period total was higher, but the cost was back at a normal level when the period ended.',
+    endLevel: 'Level at period end',
+    stateResolved: 'Resolved',
+    stateResolvedSince: (date: string) => `Resolved – falling since ${date}`,
+    stateDecreasing: 'Decreasing',
+    linkedPeriod: (period: string) => `Showing ${period} — the period the Overview finding is based on.`,
+    linkedMissing: 'That change is not in this period’s list any more.',
+    showNewest: 'Show newest',
+    fallSince: (pct: string, date: string) => `${pct} since ${date}`,
+    fallVsAverage: (pct: string) => `${pct} vs. period average`,
+    fallLabel: (date: string | null) => (date ? `Fall since ${date}` : 'Fall vs. period average'),
+    fallHint: (from: string, to: string, date: string | null) =>
+      `Daily cost fell from ${from} to ${to} a day${date ? ` since ${date}` : ', compared with the period’s average day'} (latest settled days)`,
+    resolvedHint: 'Over the latest settled days the cost runs at a level that would no longer be listed. The finding stays visible (greyed) until this period is no longer the newest one.',
+    decreasingHint: 'Still above the bar, but the latest settled days are clearly below this period’s average — the cost is falling.',
+    currentLevel: 'Current level',
+    currentLevelHint: (days: number, date: string) => `Average of the ${days} settled days up to ${date}, scaled to a whole period`,
+    hideResolved: 'Hide resolved',
+    howTitle: 'How these findings are calculated',
+    how: {
+      periodWeek: (range: string, settled: string, lag: number) =>
+        `Period analysed: the trailing 7 days ${range}. The last ${lag} days are left out because Azure still corrects them — the data is settled through ${settled}. The window moves forward every night.`,
+      periodMonth: (month: string) =>
+        `Period analysed: the complete calendar month ${month}. A month is only analysed after it has ended, and it is re-checked every night until the next month closes.`,
+      compared: (n: number, week: boolean, list: string) =>
+        `Compared with: the typical ${week ? '7 days' : 'month'} — the median of the ${n} preceding ${week ? 'non-overlapping 7-day windows' : 'complete months'}${list ? ` (${list})` : ''}. The median ignores a single unusual period. Spend with no baseline counts as new spend.`,
+      bar: (amount: string, week: boolean, pct: number) =>
+        `Listed when: the period costs at least ${amount} more per ${week ? 'week' : 'month'} AND at least ${pct}% more than typical. Meter and subscription totals are checked as well, to catch increases spread thinly over many resources.`,
+      current: (days: number, settled: string) =>
+        `Current level: every finding is also measured over the latest ${days} settled days (to ${settled}), scaled to a whole period. For a closed month these are the days after it.`,
+      resolves:
+        'Resolves automatically when: that current level would no longer clear the bar. It is marked “Resolved” on the next nightly run (~02:40 UTC) — there is no need to wait for the high days to leave the period. “Decreasing” means clearly falling, but not yet below the bar.',
+      baseline: (week: boolean): string => week
+        ? 'Becomes the new normal: if the higher cost persists, it enters the baseline windows one week at a time. Once it dominates the median — after about 3 weeks — it is “typical” and is no longer listed.'
+        : 'Becomes the new normal: if the higher cost persists, the next month is still compared with mostly older months and is listed again; from the month after that the median is the new level and it is no longer listed (about 2 months).',
+      removed: (week: boolean): string => week
+        ? 'Removed: nothing is removed by hand. The page shows the newest window, recalculated nightly; a finding disappears once the trailing 7 days no longer clear the bar. Older windows are under “Earlier”.'
+        : 'Removed: nothing is removed by hand. The page shows the newest complete month; when the next month closes, a finding only reappears if that month clears the bar too. Older months are under “Earlier”.',
+      analysedAt: (when: string) => `Last analysed: ${when}.`,
+    },
     fellOn: (date: string) => `fell on ${date}`,
     typicalOf: (n: number, of: number) => ` (${n} of ${of} mo.)`,
     typicalWeek: 'Typical 7 days',

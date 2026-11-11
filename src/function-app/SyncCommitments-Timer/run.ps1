@@ -65,6 +65,7 @@ foreach ($u in @($usage.Items)) {
         PartitionKey = 'commitment-usage'; RowKey = $rk
         BenefitId = [string]$u.id; Name = [string]$u.name; Kind = [string]$u.kind
         Used30dUsd = [double]$u.used30dUsd; Used7dUsd = [double]$u.used7dUsd
+        Quantity30d = [double]$u.quantity30d; Quantity7d = [double]$u.quantity7d; CostHidden = [bool]$u.costHidden
         Unused30dUsd = [double]$u.unused30dUsd; Unused7dUsd = [double]$u.unused7dUsd; UnusedKnown = [bool]$u.unusedKnown
         LastUsed = [string]$u.lastUsed; ResourceCount = [int]$u.resourceCount; Days = [int]$u.days
         ResourcesJson = $resJson

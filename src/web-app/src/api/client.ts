@@ -221,7 +221,13 @@ export type EvidenceFact =
       steppedDownOn?: string | null
       dailyBeforeUsd?: number | null
       dailyAfterUsd?: number | null
+      /** Where it stands now: the mean of the latest settled days, as of currentAsOf. */
+      state?: FindingState | null
+      currentDailyUsd?: number | null
+      currentAsOf?: string | null
     }
+  /** The rise is spread over resourceCount resources; the largest carries topSharePct % of it. */
+  | { id: string; kind: 'spread'; resourceCount: number; topSharePct: number; grossIncreaseUsd: number }
   | { id: string; kind: 'new-resource'; resourceId: string; name: string; resourceName?: string | null; currentUsd: number }
   | {
       id: string
@@ -300,11 +306,25 @@ export type CostSpike = {
   deltaUsd: number
   deltaPct: number | null
   isNew: boolean
-  /** Monthly: the month ENDED at a level that would not be flagged — the increase already fell back. */
+  /** The increase has already fallen back below the bar (same as state === 'resolved'). */
   resolved?: boolean
-  /** Monthly: the level the month ended at (last 7 days), scaled to a whole month. */
+  /**
+   * Where the finding stands NOW, from the mean of the latest settled days (`currentDailyUsd`):
+   * 'resolved' = that level would no longer be flagged; 'decreasing' = still above the bar but
+   * clearly below the period's average; 'open' otherwise.
+   */
+  state?: FindingState
+  /** Mean daily cost over the latest settled days, up to `currentAsOf`. USD. */
+  currentDailyUsd?: number | null
+  currentAsOf?: string | null
+  /** How far the daily cost has fallen (negative %) from `fallFromDailyUsd` to `currentDailyUsd`. */
+  fallPct?: number | null
+  fallFromDailyUsd?: number | null
+  /** The day the fall started (the step down); null = measured against the period's average day. */
+  fallSince?: string | null
+  /** The level the period ended at (its last days), scaled to a whole period. */
   exitRunRateUsd?: number | null
-  /** Monthly: the day the daily cost stepped down, when it did. */
+  /** The day the daily cost stepped down within the period, when it did. */
   steppedDownOn?: string | null
   /** How many of the baseline periods the key had cost in (the "typical" figure rests on these). */
   baselinePeriods?: number | null
@@ -348,7 +368,19 @@ export type CostSpikesResponse = {
   minDeltaUsd?: number | null
   /** …and this percentage above the period's own baseline. */
   minDeltaPct?: number | null
+  /** The windows (weekly) or months whose MEDIAN is the "typical" level, oldest first. */
+  baselineRanges?: { start: string; end: string }[]
+  /** How many prior periods form the baseline (4 weeks / 3 months). */
+  baselineCount?: number
+  /** Days excluded at the end because Azure still restates them (data runs to D-n). */
+  settlingDays?: number
+  /** Newest settled day the "current level" of each finding is measured to. */
+  settledThrough?: string | null
+  /** When the nightly detection last analysed this period (ISO). */
+  analyzedAt?: string | null
 }
+
+export type FindingState = 'open' | 'decreasing' | 'resolved'
 
 /** Result of gathering evidence (if needed) and explaining one stored cost change. */
 export type ExplainSpikeResponse = {
@@ -509,6 +541,8 @@ export type BriefChange = {
   owner?: string
   /** 'last 7 days' | 'last month' — which analysis found it */
   period?: string
+  /** Where the stored finding lives: '<week|month>|<period key>' — for a link to it. */
+  periodKey?: string
 }
 export type BriefSaving = {
   id: string
@@ -897,6 +931,11 @@ export type ReservationItem = Omit<CommitmentItem, 'kind'> & {
   hasUsageData: boolean
   used30dUsd: number | null
   used7dUsd: number | null
+  /** Usage hours / units covered over 30 and 7 days. Null on data synced before they were stored. */
+  quantity30d?: number | null
+  quantity7d?: number | null
+  /** Azure reported 0 for the covered cost while the usage is real (seen on CSP tenants). */
+  costHidden?: boolean
   /** null = not available at the scope the portal could query */
   unused30dUsd: number | null
   unused7dUsd: number | null
@@ -921,8 +960,9 @@ export const FinOpsApi = {
   getCostTrend: (days: number) => call<CostTrendResponse>(`/GetCostTrend?days=${days}`),
   getFxRates: () => call<FxRatesResponse>('/GetFxRates'),
   /** offset 0 = latest complete period of that grain, 1 = the one before it, … */
-  getCostSpikes: (periodType: PeriodType = 'week', offset = 0) =>
-    call<CostSpikesResponse>(`/GetCostSpikes?periodType=${periodType}&offset=${offset}`),
+  /** `key` = one exact period (week: its last day yyyy-MM-dd, month: yyyy-MM); otherwise `offset` back from the newest. */
+  getCostSpikes: (periodType: PeriodType = 'week', offset = 0, key?: string) =>
+    call<CostSpikesResponse>(`/GetCostSpikes?periodType=${periodType}&offset=${offset}${key ? `&key=${encodeURIComponent(key)}` : ''}`),
   getRecommendations: () => call<RecommendationsResponse>('/GetRecommendations'),
   getSavings: (includeDismissed = false) =>
     call<SavingsResponse>(`/GetSavings${includeDismissed ? '?includeDismissed=true' : ''}`),

@@ -292,6 +292,42 @@ function ConvertTo-DimensionRows {
 }
 
 # ----------------------------------------------------------------------------
+# CREATION-PERIOD TRACKING. Per key, a bitmask of the period's days that had cost (bit i = day
+# i, oldest first; periods are at most 31 days). Pure.
+#   Add-ActiveDay        mark one day for a key
+#   Get-StartedSpanDays  the days from the key's first cost day to the period end, when it
+#                        STARTED after day 0 and had cost every day after; 0 otherwise
+#   Get-RowStartedSpan   the span stored on a period row for a dimension (0 when absent)
+# ----------------------------------------------------------------------------
+function Add-ActiveDay {
+    param([Parameter(Mandatory)][hashtable]$Masks, [Parameter(Mandatory)][string]$Key, [Parameter(Mandatory)][int]$DayIndex)
+    $m = if ($Masks.ContainsKey($Key)) { [long]$Masks[$Key] } else { [long]0 }
+    $Masks[$Key] = $m -bor ([long]1 -shl $DayIndex)
+}
+
+function Get-StartedSpanDays {
+    param([long]$Mask, [int]$DayCount)
+    if ($Mask -eq 0 -or $DayCount -le 0 -or $DayCount -gt 62) { return 0 }
+    $first = 0
+    while ((($Mask -shr $first) -band 1) -eq 0) { $first++ }
+    if ($first -eq 0) { return 0 }
+    $span = $DayCount - $first
+    if ($span -le 0) { return 0 }
+    $expected = (([long]1 -shl $span) - 1) -shl $first
+    if ($Mask -ne $expected) { return 0 }
+    return $span
+}
+
+function Get-RowStartedSpan {
+    param($Row, [ValidateSet('resource', 'meter', 'subscription')][string]$Dimension = 'resource')
+    $v = switch ($Dimension) { 'meter' { $Row.MeterSpanDays } 'subscription' { $Row.SubSpanDays } default { $Row.ResSpanDays } }
+    if ($null -eq $v) { return 0 }
+    $n = 0
+    if ([int]::TryParse([string]$v, [ref]$n)) { return $n }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
 # Measure-DailyDimensionCost — STEP 2a. Aggregate one day's raw rows to per-dimension
 # totals. Pure; no AI, no I/O. Returns array of { Date, DimensionKey, Scope, ResourceId,
 # Meter, CostUsd }.
@@ -345,16 +381,27 @@ function Measure-DailyDimensionCost {
 # reservation installment inside the window inflates it enormously. The median ignores that
 # day. -Statistic Mean restores the old behaviour.
 # ----------------------------------------------------------------------------
+#
+# CREATION PERIODS. A key that STARTED during a baseline period and ran every day from then to
+# the period's end (Get-StartedSpanDays, stored on the row per dimension) only paid for part of
+# it — a VM created on the 12th looks like a cheap month, which inflates the next month's
+# increase and keeps it listed for an extra period. With -ScaleStartedTo, such a period counts
+# at its daily level x that many days; one that started in its last -MinStartedSpan - 1 days is
+# left out (its first day is usually a partial day). Gaps mean an intermittent workload, which
+# is never scaled — its real period cost IS its typical cost.
 function Measure-DimensionBaseline {
     param(
         $Rows,
         [ValidateSet('Median', 'Mean')][string]$Statistic = 'Median',
-        [ValidateSet('resource', 'meter', 'subscription')][string]$Dimension = 'resource'
+        [ValidateSet('resource', 'meter', 'subscription')][string]$Dimension = 'resource',
+        [int]$ScaleStartedTo = 0,
+        [int]$MinStartedSpan = 3
     )
     $baseline = @{}
     if (-not $Rows) { return $baseline }
     # Single streaming pass: key -> (period -> total). No Group-Object, no re-keyed copy.
     $byKey = @{}
+    $spans = @{}   # "key|period" -> started span (days), 0 = whole period / not a creation period
     foreach ($r in $Rows) {
         $key = if ($Dimension -eq 'resource') { [string]$r.DimensionKey }
                else { Get-DimensionKey -Dimension $Dimension -Scope ([string]$r.Scope) -Meter ([string]$r.Meter) -ResourceId ([string]$r.ResourceId) }
@@ -362,9 +409,23 @@ function Measure-DimensionBaseline {
         $d = [string]$r.Date
         if (-not $byKey[$key].ContainsKey($d)) { $byKey[$key][$d] = 0.0 }
         $byKey[$key][$d] += [double]$r.CostUsd
+        if ($ScaleStartedTo -gt 0) {
+            $s = Get-RowStartedSpan -Row $r -Dimension $Dimension
+            if ($s -gt 0) { $spans["$key|$d"] = $s }
+        }
     }
-    foreach ($key in $byKey.Keys) {
+    if ($ScaleStartedTo -gt 0 -and $spans.Count) {
+        foreach ($sk in @($spans.Keys)) {
+            $i = $sk.LastIndexOf('|')
+            $key = $sk.Substring(0, $i); $d = $sk.Substring($i + 1)
+            $span = [int]$spans[$sk]
+            if ($span -lt $MinStartedSpan) { [void]$byKey[$key].Remove($d) }
+            else { $byKey[$key][$d] = [double]$byKey[$key][$d] / $span * $ScaleStartedTo }
+        }
+    }
+    foreach ($key in @($byKey.Keys)) {
         $perDay = $byKey[$key]
+        if (-not $perDay.Count) { continue }
         if ($Statistic -eq 'Mean') {
             $dayCount = [Math]::Max(1, $perDay.Keys.Count)
             $total = 0.0
@@ -512,7 +573,9 @@ function Measure-ExitRunRate {
 # -Series  hashtable key -> double[DayCount], filled in place
 # -Wanted  hashtable of the keys to track (resource ids, 'meter:..' and 'sub:..' keys alike)
 # Each row counts toward its resource, its meter rollup (that day's label) and its subscription,
-# keyed exactly as detection keys them.
+# keyed exactly as detection keys them. A category row (Kind 'category', the ingest's exact
+# per-category day total) counts toward its meter key only; with -NoMeterLabels the resource
+# rows no longer do, so a meter key is built from one basis, never both.
 # ----------------------------------------------------------------------------
 function Add-DailySeriesRows {
     param(
@@ -520,14 +583,25 @@ function Add-DailySeriesRows {
         [Parameter(Mandatory)][hashtable]$Wanted,
         $Rows,
         [Parameter(Mandatory)][int]$DayIndex,
-        [Parameter(Mandatory)][int]$DayCount
+        [Parameter(Mandatory)][int]$DayCount,
+        # Meter keys come from category rows (Kind 'category'), not from the resources' labels.
+        [switch]$NoMeterLabels
     )
     foreach ($r in @($Rows)) {
         if ($null -eq $r) { continue }
         $scope = [string]$r.Scope
-        foreach ($k in @([string]$r.DimensionKey,
-                         (Get-DimensionKey -Dimension 'meter' -Scope $scope -Meter ([string]$r.Meter)),
-                         (Get-DimensionKey -Dimension 'subscription' -Scope $scope))) {
+        $keys = if ([string]$r.Kind -eq 'category') {
+            # A category total counts toward its meter key only; the resource rows already carry
+            # the same cost for the resource and subscription keys.
+            @(Get-DimensionKey -Dimension 'meter' -Scope $scope -Meter ([string]$r.Meter))
+        } elseif ($NoMeterLabels) {
+            @([string]$r.DimensionKey, (Get-DimensionKey -Dimension 'subscription' -Scope $scope))
+        } else {
+            @([string]$r.DimensionKey,
+              (Get-DimensionKey -Dimension 'meter' -Scope $scope -Meter ([string]$r.Meter)),
+              (Get-DimensionKey -Dimension 'subscription' -Scope $scope))
+        }
+        foreach ($k in $keys) {
             if (-not $k -or -not $Wanted.ContainsKey($k)) { continue }
             if (-not $Series.ContainsKey($k)) { $Series[$k] = [double[]]::new($DayCount) }
             $Series[$k][$DayIndex] += [double]$r.CostUsd
@@ -555,6 +629,67 @@ function Test-ExitRunRateResolved {
 }
 
 # ----------------------------------------------------------------------------
+# Get-FindingState — where does a finding stand NOW? Pure.
+# A finding describes a whole period, but what the reader wants to know is whether the money is
+# still being spent. -RecentDailyUsd is the mean of the latest settled days (up to D-2), which
+# for a closed month can lie after the period itself.
+#   resolved    the recent level, scaled to a whole period, would not clear the bar any more
+#   decreasing  still above the bar, but the recent level is materially below the period's
+#               average day (at most -DecreasingRatio of it)
+#   open        otherwise
+# Returns 'open' when the recent level is unknown ($null / negative).
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Get-CostFall — how far has the daily cost fallen, and since when? Pure.
+# With a step down in the period (-SteppedDownOn / -BeforeDailyUsd from Measure-ExitRunRate) the
+# fall is measured from the level before that step, "since" that day. Without one, from the
+# period's average day (-SpikeUsd / -PeriodDays), with no date. Returns $null when the current
+# level is unknown or not below the reference; otherwise { Pct (negative); FromDailyUsd; Since }.
+# ----------------------------------------------------------------------------
+function Get-CostFall {
+    param(
+        $CurrentDailyUsd,
+        $BeforeDailyUsd,
+        [string]$SteppedDownOn = '',
+        [double]$SpikeUsd = 0,
+        [int]$PeriodDays = 0
+    )
+    if ($null -eq $CurrentDailyUsd -or [double]$CurrentDailyUsd -lt 0) { return $null }
+    $from = $null; $since = ''
+    if ($SteppedDownOn -and $null -ne $BeforeDailyUsd -and [double]$BeforeDailyUsd -gt 0) {
+        $from = [double]$BeforeDailyUsd; $since = $SteppedDownOn
+    } elseif ($PeriodDays -gt 0 -and $SpikeUsd -gt 0) {
+        $from = $SpikeUsd / $PeriodDays
+    }
+    if ($null -eq $from -or [double]$CurrentDailyUsd -ge $from) { return $null }
+    return [PSCustomObject]@{
+        Pct          = [Math]::Round(([double]$CurrentDailyUsd - $from) / $from * 100, 1)
+        FromDailyUsd = [Math]::Round($from, 2)
+        Since        = $since
+    }
+}
+
+function Get-FindingState {
+    param(
+        $RecentDailyUsd,
+        [Parameter(Mandatory)][int]$PeriodDays,
+        [Parameter(Mandatory)][double]$BaselineUsd,
+        [Parameter(Mandatory)][double]$SpikeUsd,
+        [double]$MinDeltaUsd = 25,
+        [double]$MinDeltaPct = 50,
+        [double]$DecreasingRatio = 0.75
+    )
+    if ($null -eq $RecentDailyUsd -or [double]$RecentDailyUsd -lt 0 -or $PeriodDays -le 0) { return 'open' }
+    $recent = [double]$RecentDailyUsd
+    if (Test-ExitRunRateResolved -ExitRunRateUsd ($recent * $PeriodDays) -BaselineUsd $BaselineUsd -MinDeltaUsd $MinDeltaUsd -MinDeltaPct $MinDeltaPct) {
+        return 'resolved'
+    }
+    $avgDaily = $SpikeUsd / $PeriodDays
+    if ($avgDaily -gt 0 -and $recent -le $avgDaily * $DecreasingRatio) { return 'decreasing' }
+    return 'open'
+}
+
+# ----------------------------------------------------------------------------
 # Measure-BaselineCoverage — in how many baseline periods did each key appear? Pure.
 # Measure-DimensionBaseline skips periods where a key had no cost (so intermittent workloads are
 # not flagged), which means a "typical" figure can rest on one period out of three. This says
@@ -563,11 +698,18 @@ function Test-ExitRunRateResolved {
 function Measure-BaselineCoverage {
     param(
         $Rows,
-        [ValidateSet('resource', 'meter', 'subscription')][string]$Dimension = 'resource'
+        [ValidateSet('resource', 'meter', 'subscription')][string]$Dimension = 'resource',
+        # Periods the key started in its last few days are left out, as Measure-DimensionBaseline
+        # does with -ScaleStartedTo. 0 = count every period.
+        [int]$MinStartedSpan = 0
     )
     $byKey = @{}
     foreach ($r in @($Rows)) {
         if ($null -eq $r) { continue }
+        if ($MinStartedSpan -gt 0) {
+            $s = Get-RowStartedSpan -Row $r -Dimension $Dimension
+            if ($s -gt 0 -and $s -lt $MinStartedSpan) { continue }
+        }
         $key = if ($Dimension -eq 'resource') { [string]$r.DimensionKey }
                else { Get-DimensionKey -Dimension $Dimension -Scope ([string]$r.Scope) -Meter ([string]$r.Meter) -ResourceId ([string]$r.ResourceId) }
         if (-not $byKey.ContainsKey($key)) { $byKey[$key] = @{} }
@@ -1432,6 +1574,7 @@ function Read-DailyResourceCost {
     # Aggregate across meter categories to (date, resource): sum cost, remember the meter
     # that contributed the most (a useful label without exploding row count).
     $agg = @{}          # "date|resourceId" -> { Date; ResourceId; CostUsd; TopMeter; TopMeterCost }
+    $catAgg = @{}       # "date|meterCategory" -> { Date; Meter; CostUsd } (resource-attributed rows)
     $usdByDate = @{}    # 'yyyy-MM-dd' -> every row's cost, resource or not
     $uri = "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.CostManagement/query?api-version=2023-11-01"
     do {
@@ -1476,6 +1619,11 @@ function Read-DailyResourceCost {
             $e = $agg[$key]
             $e.CostUsd += $cost
             if ($cost -gt $e.TopMeterCost) { $e.TopMeterCost = $cost; $e.TopMeter = $meter }
+            # The same cost per (day, meter category) — exact category totals, which the per-
+            # resource label cannot give (a VM's Defender charge sits under 'Virtual Machines').
+            $ck = "$date|$meter"
+            if (-not $catAgg.ContainsKey($ck)) { $catAgg[$ck] = [PSCustomObject]@{ Date = $date; Meter = $meter; CostUsd = 0.0 } }
+            $catAgg[$ck].CostUsd += $cost
         }
         # A page of rows that yields nothing usable is a parsing mismatch, not an empty tenant.
         # Say so, with the column names — that is the fact that identifies it.
@@ -1488,7 +1636,12 @@ function Read-DailyResourceCost {
     $out = foreach ($e in $agg.Values) {
         [PSCustomObject]@{ Date = $e.Date; ResourceId = $e.ResourceId; Scope = $SubscriptionId; Meter = $e.TopMeter; CostUsd = $e.CostUsd }
     }
-    return @{ Rows = @($out); UsdByDate = $usdByDate }
+    # Same basis as Rows (resource-attributed cost only), so the meter grain adds up to the
+    # subscription grain exactly; it is only split differently.
+    $cats = foreach ($c in $catAgg.Values) {
+        [PSCustomObject]@{ Date = $c.Date; Scope = $SubscriptionId; Meter = $c.Meter; CostUsd = $c.CostUsd }
+    }
+    return @{ Rows = @($out); CategoryRows = @($cats); UsdByDate = $usdByDate }
 }
 
 # ----------------------------------------------------------------------------
@@ -1497,7 +1650,8 @@ function Read-DailyResourceCost {
 # the billing currency (CostSummary 'dailysub'). The old ingest spent a third query per
 # subscription on the USD total; it comes from the per-resource query now (Read-DailyResourceCost).
 #
-# Returns @{ Rows; Days = @{ 'yyyy-MM-dd' -> @{ Usd; Billing; Currency } }; Currency }.
+# Returns @{ Rows; CategoryRows; Days = @{ 'yyyy-MM-dd' -> @{ Usd; Billing; Currency } }; Currency }.
+# CategoryRows: { Date; Scope; Meter (category); CostUsd } — the same cost per meter category.
 # A day Azure returns nothing for is absent from Days (the caller decides whether that is a zero).
 # Keep the range inside one calendar month where possible: the Query API charges one QPU per
 # month of data a request touches.
@@ -1522,7 +1676,7 @@ function Get-SubscriptionDailyCost {
             Currency = $native.Currency
         }
     }
-    return @{ Rows = @($res.Rows); Days = $days; Currency = $native.Currency }
+    return @{ Rows = @($res.Rows); CategoryRows = @($res.CategoryRows); Days = $days; Currency = $native.Currency }
 }
 
 # ----------------------------------------------------------------------------
@@ -2015,9 +2169,9 @@ Export-ModuleMember -Function `
     Get-PeriodKey, Get-PeriodBounds, Get-UtcMonthStart, Test-PeriodComplete, Get-CompletePeriodKeys, `
     ConvertTo-PeriodRows, Get-PeriodBaselineCount, Get-PeriodRetentionFloorDays, `
     Get-RollingWindows, Get-RollingWindowEndDate, `
-    ConvertTo-DimensionRows, Measure-DailyDimensionCost, Measure-DimensionBaseline, `
+    ConvertTo-DimensionRows, Measure-DailyDimensionCost, Measure-DimensionBaseline, Add-ActiveDay, Get-StartedSpanDays, Get-RowStartedSpan, Get-DimensionKey, `
     Find-CostSpike, Select-UnexplainedSpike, `
-    Measure-ExitRunRate, Test-ExitRunRateResolved, Measure-BaselineCoverage, Add-DailySeriesRows, `
+    Measure-ExitRunRate, Test-ExitRunRateResolved, Get-FindingState, Get-CostFall, Measure-BaselineCoverage, Add-DailySeriesRows, `
     Get-ResourceContext, ConvertTo-PseudonymousActor, Resolve-CostColumn, `
     Get-NarrationKey, Test-NarrativeGrounding, `
     Get-CostQueryDimensions, Invoke-CostQuery, Get-DailyResourceCost, Get-SubscriptionDailyCost, Invoke-CostQueryRest, `

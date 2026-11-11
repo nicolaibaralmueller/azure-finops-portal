@@ -106,8 +106,8 @@ function Get-UnusedCommitmentCost {
 #            the prorated commitment cost each resource consumed;
 #   unused   charge types UnusedReservation / UnusedSavingsPlan, by benefit.
 # The Query API allows two groupings, hence two queries. Pages are followed (properties.nextLink).
-# Returns @{ Items = [{ id; name; kind; used30dUsd; used7dUsd; unused30dUsd; unused7dUsd;
-#   unusedKnown; lastUsed; resourceCount; resources = [{ resourceId; subscriptionId;
+# Returns @{ Items = [{ id; name; kind; used30dUsd; used7dUsd; quantity30d; quantity7d; costHidden;
+#   unused30dUsd; unused7dUsd; unusedKnown; lastUsed; resourceCount; resources = [{ resourceId; subscriptionId;
 #   resourceGroup; name; cost30dUsd; cost7dUsd; quantity30d; sharePct; lastUsed; days }] }];
 #   Notes }. Never throws.
 # ----------------------------------------------------------------------------
@@ -149,6 +149,55 @@ function Invoke-CommitmentDailyQuery {
     return $rows
 }
 
+# Id -> name pairs over a window, one row per commitment (granularity None). Rows as hashtables.
+function Invoke-CommitmentNameQuery {
+    param([Parameter(Mandatory)][string]$MgmtToken, [Parameter(Mandatory)][string]$Scope, [Parameter(Mandatory)]$Filter,
+          [Parameter(Mandatory)][string[]]$Grouping, [datetime]$From, [datetime]$To, [int]$MaxPages = 5)
+    $body = @{
+        type = 'AmortizedCost'; timeframe = 'Custom'
+        timePeriod = @{ from = $From.ToString('yyyy-MM-dd'); to = $To.ToString('yyyy-MM-dd') }
+        dataset = @{
+            granularity = 'None'
+            aggregation = @{ totalCost = @{ name = 'CostUSD'; function = 'Sum' } }
+            grouping = @($Grouping | ForEach-Object { @{ type = 'Dimension'; name = $_ } })
+            filter = $Filter
+        }
+    } | ConvertTo-Json -Depth 12
+    $uri = "https://management.azure.com$Scope/providers/Microsoft.CostManagement/query?api-version=2023-11-01"
+    $rows = [System.Collections.Generic.List[hashtable]]::new()
+    for ($page = 0; $page -lt $MaxPages -and $uri; $page++) {
+        $resp = Invoke-CostQueryRest -Token $MgmtToken -Body $body -Uri $uri
+        $cols = @($resp.properties.columns.name)
+        foreach ($r in @($resp.properties.rows)) {
+            $h = @{}
+            for ($i = 0; $i -lt $cols.Count; $i++) { $h[[string]$cols[$i]] = $r[$i] }
+            $rows.Add($h)
+        }
+        $uri = [string]$resp.properties.nextLink
+    }
+    return $rows
+}
+
+# Is this a usable display name, or just an id / GUID? Pure.
+function Test-CommitmentDisplayName {
+    param([string]$Name)
+    if (-not $Name -or -not $Name.Trim()) { return $false }
+    if ($Name -match '^(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$') { return $false }
+    if ($Name -match '^/providers/') { return $false }
+    return $true
+}
+
+# The name to show for a commitment: the first real display name, else "<Kind> <first 8 of id>"
+# (as the unused-commitment findings already do) — never a bare GUID. Pure.
+function Get-CommitmentDisplayName {
+    param([string[]]$Candidates, [string]$Id, [string]$Kind = 'reservation')
+    foreach ($c in @($Candidates)) { if (Test-CommitmentDisplayName $c) { return [string]$c } }
+    $short = ([string]$Id -split '/')[-1]
+    if ($short.Length -gt 8) { $short = $short.Substring(0, 8) }
+    $kindText = if ($Kind -eq 'savings plan') { 'Savings plan' } else { 'Reservation' }
+    return "$kindText $short".Trim()
+}
+
 function Get-CommitmentConsumption {
     param(
         [Parameter(Mandatory)][string]$MgmtToken,
@@ -166,7 +215,7 @@ function Get-CommitmentConsumption {
         if (-not $byId.ContainsKey($Id)) {
             $byId[$Id] = [PSCustomObject]@{ id = $Id; name = $Name; kind = (Get-CommitmentKind $Id)
                 used30dUsd = 0.0; used7dUsd = 0.0; unused30dUsd = 0.0; unused7dUsd = 0.0; unusedKnown = $true; lastUsed = $null
-                resourceCount = 0; resources = @{} }
+                quantity30d = 0.0; quantity7d = 0.0; resourceCount = 0; resources = @{} }
         } elseif ($Name -and -not $byId[$Id].name) { $byId[$Id].name = $Name }
         return $byId[$Id]
     }
@@ -192,9 +241,9 @@ function Get-CommitmentConsumption {
                             cost30dUsd = 0.0; cost7dUsd = 0.0; quantity30d = 0.0; sharePct = 0.0; lastUsed = $null; days = 0; dayKeys = @{} }
                     }
                     $res = $c.resources[$rid]
-                    $res.cost30dUsd += $cost; $res.quantity30d += $qty; $c.used30dUsd += $cost
+                    $res.cost30dUsd += $cost; $res.quantity30d += $qty; $c.used30dUsd += $cost; $c.quantity30d += $qty
                     if ($day) {
-                        if ($day -ge $from7) { $res.cost7dUsd += $cost; $c.used7dUsd += $cost }
+                        if ($day -ge $from7) { $res.cost7dUsd += $cost; $c.used7dUsd += $cost; $c.quantity7d += $qty }
                         $dk = $day.ToString('yyyy-MM-dd')
                         if ($cost -gt 0 -or $qty -gt 0) {
                             $res.dayKeys[$dk] = $true
@@ -206,6 +255,26 @@ function Get-CommitmentConsumption {
                 $done = $true
             } catch {
                 if ($idCol -eq 'ReservationId') { $notes += "commitment usage query failed at ${scope}: $($_.Exception.Message)" }
+            }
+        }
+        # Names for every commitment with usage. The usage query above is grouped by id and
+        # resource (the Query API allows two groupings), so it carries no name; the unused-hours
+        # query below only names commitments that HAD unused hours. A fully used reservation was
+        # therefore shown by its GUID. One small un-bucketed query fixes that.
+        $done = $false
+        foreach ($pair in @(@('BenefitId', 'BenefitName'), @('ReservationId', 'ReservationName'))) {
+            if ($done) { break }
+            try {
+                $rows = Invoke-CommitmentNameQuery -MgmtToken $MgmtToken -Scope $scope -Filter $pricing -Grouping $pair -From $from -To $to
+                foreach ($r in $rows) {
+                    $id = ([string]$r[$pair[0]]).ToLowerInvariant()
+                    $nm = [string]$r[$pair[1]]
+                    if (-not $id -or -not $nm -or -not $byId.ContainsKey($id)) { continue }
+                    [void](& $get $id $nm)
+                }
+                $done = $true
+            } catch {
+                if ($pair[0] -eq 'ReservationId') { Write-Host "commitment name query failed at ${scope}: $($_.Exception.Message)" }
             }
         }
         $done = $false
@@ -230,14 +299,21 @@ function Get-CommitmentConsumption {
         }
     }
     $items = foreach ($c in $byId.Values) {
-        $res = @($c.resources.Values | Sort-Object cost30dUsd -Descending | ForEach-Object {
+        # Some tenants (seen on a CSP tenant, 2026-11-11) get 0 for the amortized cost of usage a
+        # reservation covers, at subscription scope, in USD and billing currency alike, while the
+        # quantities are real. Then the shares are taken from the quantities, and the page shows
+        # the covered amount as unknown rather than as 0.
+        $byQty = $c.used30dUsd -le 0 -and $c.quantity30d -gt 0
+        $res = @($c.resources.Values | Sort-Object @{ Expression = { if ($byQty) { $_.quantity30d } else { $_.cost30dUsd } } } -Descending | ForEach-Object {
             [PSCustomObject]@{ resourceId = $_.resourceId; subscriptionId = $_.subscriptionId; resourceGroup = $_.resourceGroup; name = $_.name
                 cost30dUsd = [Math]::Round($_.cost30dUsd, 2); cost7dUsd = [Math]::Round($_.cost7dUsd, 2); quantity30d = [Math]::Round($_.quantity30d, 2)
-                sharePct = if ($c.used30dUsd -gt 0) { [Math]::Round(100 * $_.cost30dUsd / $c.used30dUsd, 1) } else { 0.0 }
+                sharePct = if ($c.used30dUsd -gt 0) { [Math]::Round(100 * $_.cost30dUsd / $c.used30dUsd, 1) }
+                           elseif ($byQty) { [Math]::Round(100 * $_.quantity30d / $c.quantity30d, 1) } else { 0.0 }
                 lastUsed = $_.lastUsed; days = $_.dayKeys.Count }
         })
         [PSCustomObject]@{ id = $c.id; name = $c.name; kind = $c.kind
             used30dUsd = [Math]::Round($c.used30dUsd, 2); used7dUsd = [Math]::Round($c.used7dUsd, 2)
+            quantity30d = [Math]::Round($c.quantity30d, 2); quantity7d = [Math]::Round($c.quantity7d, 2); costHidden = $byQty
             unused30dUsd = [Math]::Round($c.unused30dUsd, 2); unused7dUsd = [Math]::Round($c.unused7dUsd, 2); unusedKnown = (-not $unusedFailed)
             lastUsed = $c.lastUsed; resourceCount = $res.Count; resources = $res; days = $Days }
     }
@@ -320,7 +396,9 @@ function Get-CommitmentInventory {
                     $items += [PSCustomObject]@{
                         kind = $src.Kind
                         id = ([string]$x.id).ToLowerInvariant()
-                        name = if ($p.displayName) { [string]$p.displayName } else { [string]$x.name }
+                        # displayName only: the ARM name is 'orderId/reservationId' — two GUIDs, which
+                        # the page would show as the name. Empty lets the billing data's name win.
+                        name = if ($p.displayName) { [string]$p.displayName } else { '' }
                         location = [string]$x.location
                         sku = if ($p.skuDescription) { [string]$p.skuDescription } elseif ($x.sku.name) { [string]$x.sku.name } else { '' }
                         quantity = if ($null -ne $p.quantity) { [int]$p.quantity } else { $null }
@@ -421,4 +499,5 @@ function Get-CommitmentRecommendations {
 
 Export-ModuleMember -Function `
     Get-UnusedCommitmentCost, ConvertTo-UnusedCommitmentFindings, Get-CommitmentInventory, `
-    Get-CommitmentRecommendations, Get-UtilisationAggregates, Get-CommitmentConsumption, ConvertFrom-CostUsageDate
+    Get-CommitmentRecommendations, Get-UtilisationAggregates, Get-CommitmentConsumption, ConvertFrom-CostUsageDate, `
+    Test-CommitmentDisplayName, Get-CommitmentDisplayName

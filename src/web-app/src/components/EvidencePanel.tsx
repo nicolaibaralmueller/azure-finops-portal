@@ -52,6 +52,12 @@ function resourceLabel(f: { resourceId?: string | null; resourceName?: string | 
   return f.name ?? ''
 }
 
+/** Days in the analysed period, to scale a daily level to "per period". */
+function periodLength(e: CostChangeEvidence): number {
+  const s = Date.parse(e.currentStart), x = Date.parse(e.currentEnd)
+  return Number.isNaN(s) || Number.isNaN(x) ? 1 : Math.round((x - s) / 86400000) + 1
+}
+
 /** A short one-line summary of the evidence, for a collapsed card. */
 export function evidenceSummary(e: CostChangeEvidence | null | undefined): string | null {
   if (!e) return null
@@ -111,11 +117,16 @@ export function EvidencePanel({ evidence, periodType, citedFacts = [] }: Props) 
     .sort((a, b) => a.time.localeCompare(b.time))
   const owner = evidence.facts.find((f): f is Extract<EvidenceFact, { kind: 'owner' }> => f.kind === 'owner')
   const shape = evidence.facts.find((f): f is Extract<EvidenceFact, { kind: 'daily-shape' }> => f.kind === 'daily-shape')
-  const driverHeader = drivers[0]?.driverKind === 'resource' ? t.evidence.resource : drivers[0]?.driverKind === 'service' ? t.evidence.service : t.evidence.meter
+  const spread = evidence.facts.find((f): f is Extract<EvidenceFact, { kind: 'spread' }> => f.kind === 'spread')
+  const kinds = new Set(drivers.map((d) => d.driverKind))
+  const driverHeader = kinds.size > 1
+    ? (kinds.has('service') ? `${t.evidence.service} / ${t.evidence.resource.toLowerCase()}` : t.evidence.meterOrResource)
+    : drivers[0]?.driverKind === 'resource' ? t.evidence.resource : drivers[0]?.driverKind === 'service' ? t.evidence.service : t.evidence.meter
+  const basis = evidence.baselinePeriods > 0 ? t.evidence.basis(evidence.baselinePeriods, periodType === 'week') : evidence.basis
 
   return (
     <div className={styles.root}>
-      <Text size={200} className={styles.muted}>{evidence.basis}</Text>
+      <Text size={200} className={styles.muted}>{basis}</Text>
       {!evidence.complete && (
         <Text size={200} className={styles.warn}>
           <Warning16Regular />
@@ -131,7 +142,10 @@ export function EvidencePanel({ evidence, periodType, citedFacts = [] }: Props) 
           {shape.steppedDownOn && shape.dailyBeforeUsd != null && shape.dailyAfterUsd != null
             ? t.evidence.shapeStep(shape.steppedDownOn, money(shape.dailyBeforeUsd), money(shape.dailyAfterUsd), money(shape.exitRunRateUsd))
             : t.evidence.shapeEnd(money(shape.exitRunRateUsd))}
-          {shape.resolved ? ` ${t.evidence.shapeResolved}` : ''}
+          {shape.resolved && !shape.state ? ` ${t.evidence.shapeResolved}` : ''}
+          {shape.state && shape.currentDailyUsd != null && shape.currentAsOf && (
+            <> {t.evidence.shapeNow(shape.state, money(shape.currentDailyUsd * periodLength(evidence)), whenLabel(shape.currentAsOf))}</>
+          )}
         </Text>
       )}
 
@@ -186,6 +200,14 @@ export function EvidencePanel({ evidence, periodType, citedFacts = [] }: Props) 
         </div>
       )}
 
+      {spread && (
+        <Text size={200}>
+          <FactId id={spread.id} cited={cited.has(spread.id)} />{' '}
+          {t.evidence.spread(spread.resourceCount, String(Math.round(spread.topSharePct)))}
+          {spread.topSharePct < 10 ? ` ${t.evidence.spreadThin}` : ''}
+        </Text>
+      )}
+
       {split && (() => {
         // Only name the parts that matter: rounding noise of a few units is not a finding.
         const floor = Math.max(1, Math.abs(split.netDeltaUsd) * 0.02)
@@ -226,7 +248,7 @@ export function EvidencePanel({ evidence, periodType, citedFacts = [] }: Props) 
       <Text size={200} weight="semibold" className={styles.sectionHead}><History16Regular /> {t.evidence.changesHead}</Text>
       {changes.length === 0 ? (
         <Text size={200} className={styles.muted}>
-          {t.evidence.noChanges(drivers[0]?.driverKind === 'meter')}
+          {t.evidence.noChanges(evidence.dimension === 'resource')}
         </Text>
       ) : (
         <ul className={styles.list}>

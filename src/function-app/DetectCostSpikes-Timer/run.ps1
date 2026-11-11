@@ -96,8 +96,12 @@ function Update-PeriodRollup {
     # 'Microsoft Defender for Cloud' on the 1st, so its entire month — compute and disk after the
     # 12th included — landed in the Defender meter rollup.
     $acc = @{}   # "dimensionKey|meter" -> accumulated row
+    # Which days each resource / meter / subscription had cost, to spot a creation period
+    # (Get-StartedSpanDays) — the baseline scales those to a whole month.
+    $masks = @{ res = @{}; meter = @{}; sub = @{} }
     $days = 0
     for ($d = $bounds.Start; $d -le $bounds.End; $d = $d.AddDays(1)) {
+        $dayIndex = ($d - $bounds.Start).Days
         $dayKey = $d.ToString('yyyy-MM-dd')
         $rows = @()
         try {
@@ -115,9 +119,15 @@ function Update-PeriodRollup {
                 $acc[$ak] = [PSCustomObject]@{ DimensionKey = $k; Scope = [string]$r.Scope; ResourceId = [string]$r.ResourceId; Meter = [string]$r.Meter; CostUsd = 0.0 }
             }
             $acc[$ak].CostUsd += [double]$r.CostUsd
+            if ([double]$r.CostUsd -gt 0) {
+                Add-ActiveDay -Masks $masks.res -Key $k -DayIndex $dayIndex
+                Add-ActiveDay -Masks $masks.meter -Key (Get-DimensionKey -Dimension 'meter' -Scope ([string]$r.Scope) -Meter ([string]$r.Meter)) -DayIndex $dayIndex
+                Add-ActiveDay -Masks $masks.sub -Key (Get-DimensionKey -Dimension 'subscription' -Scope ([string]$r.Scope)) -DayIndex $dayIndex
+            }
         }
     }
     if (-not $acc.Count) { return 0 }
+    $periodDays = ($bounds.End - $bounds.Start).Days + 1
 
     # COVERAGE GATE. A period is only rolled up when snapshots exist for EVERY day of it.
     # Without this, a period that the data only partly covers — the month ingest started
@@ -148,25 +158,113 @@ function Update-PeriodRollup {
             Meter        = $e.Meter
             CostUsd      = [Math]::Round([double]$e.CostUsd, 4)
             DaysWithData = $days
+            # Creation period: days from the first cost day to month end when the key started
+            # this month and ran every day after (0 = not a creation period). Per dimension.
+            ResSpanDays   = Get-StartedSpanDays -Mask ([long]($masks.res[$e.DimensionKey] ?? 0)) -DayCount $periodDays
+            MeterSpanDays = Get-StartedSpanDays -Mask ([long]($masks.meter[(Get-DimensionKey -Dimension 'meter' -Scope $e.Scope -Meter $e.Meter)] ?? 0)) -DayCount $periodDays
+            SubSpanDays   = Get-StartedSpanDays -Mask ([long]($masks.sub[(Get-DimensionKey -Dimension 'subscription' -Scope $e.Scope)] ?? 0)) -DayCount $periodDays
         }
     }
     Set-TableEntityBatch -Table 'CostPeriods' -Entities @($entities) -Token $Token
     return @($entities).Count
 }
 
+# The meter grain's own rollup: one row per (subscription, meter category) from the ingest's
+# exact per-category day totals (CostSnapshots 'cat|yyyy-MM-dd'), next to the per-resource rows in
+# the same CostPeriods partition (RowKey 'cat|...', Kind 'category'). The per-resource rows can
+# only give a category the cost of resources whose LARGEST category it was that day — a VM's
+# Defender plan counts as 'Virtual Machines' — so a category rollup built from them misses most of
+# a cost spread thinly over many resources. Same coverage rule as the resource rollup: every day
+# must have category rows, or nothing is written and the meter grain keeps the label basis.
+# Returns the number of rows written (0 = not covered).
+function Update-PeriodCategoryRollup {
+    param(
+        [Parameter(Mandatory)][ValidateSet('week', 'month')][string]$PeriodType,
+        [Parameter(Mandatory)][string]$PeriodKey,
+        [Parameter(Mandatory)][string]$Token
+    )
+    $bounds = Get-PeriodBounds -PeriodKey $PeriodKey -PeriodType $PeriodType
+    $periodDays = ($bounds.End - $bounds.Start).Days + 1
+    $acc = @{}; $masks = @{}; $days = 0
+    for ($d = $bounds.Start; $d -le $bounds.End; $d = $d.AddDays(1)) {
+        $rows = @(Get-TableEntities -Table 'CostSnapshots' -Filter "PartitionKey eq 'cat|$($d.ToString('yyyy-MM-dd'))'" -Token $Token)
+        if (-not $rows.Count) {
+            Write-Host "  rollup: no category totals for $($d.ToString('yyyy-MM-dd')) — $PeriodType $PeriodKey keeps the label basis for meters."
+            return 0
+        }
+        $days++
+        $dayIndex = ($d - $bounds.Start).Days
+        foreach ($r in $rows) {
+            $k = [string]$r.DimensionKey
+            if (-not $k) { continue }
+            if (-not $acc.ContainsKey($k)) { $acc[$k] = [PSCustomObject]@{ DimensionKey = $k; Scope = [string]$r.Scope; Meter = [string]$r.Meter; CostUsd = 0.0 } }
+            $acc[$k].CostUsd += [double]$r.CostUsd
+            if ([double]$r.CostUsd -gt 0) { Add-ActiveDay -Masks $masks -Key $k -DayIndex $dayIndex }
+        }
+    }
+    $old = @(Get-TableEntities -Table 'CostPeriods' -Filter "PartitionKey eq '$PeriodType|$PeriodKey' and RowKey ge 'cat|' and RowKey lt 'cat|~'" -Select 'PartitionKey,RowKey' -Token $Token)
+    if ($old.Count) { [void](Remove-TableEntityBatch -Table 'CostPeriods' -Entities $old -Token $Token) }
+    $entities = foreach ($e in $acc.Values) {
+        @{
+            PartitionKey  = "$PeriodType|$PeriodKey"
+            RowKey        = "cat|$(Get-ShortHash -Value $e.DimensionKey)"
+            Kind          = 'category'
+            PeriodType    = $PeriodType
+            Period        = $PeriodKey
+            DimensionKey  = $e.DimensionKey
+            Scope         = $e.Scope
+            ResourceId    = ''
+            Meter         = $e.Meter
+            CostUsd       = [Math]::Round([double]$e.CostUsd, 4)
+            DaysWithData  = $days
+            MeterSpanDays = Get-StartedSpanDays -Mask ([long]($masks[$e.DimensionKey] ?? 0)) -DayCount $periodDays
+        }
+    }
+    if (@($entities).Count) { Set-TableEntityBatch -Table 'CostPeriods' -Entities @($entities) -Token $Token }
+    return @($entities).Count
+}
+
+# Category totals exist for a month's first and last day — cheap probe before a full read.
+function Test-PeriodHasCategories {
+    param([string]$PeriodType, [string]$PeriodKey, [string]$Token)
+    $bounds = Get-PeriodBounds -PeriodKey $PeriodKey -PeriodType $PeriodType
+    foreach ($d in @($bounds.Start, $bounds.End)) {
+        $probe = @(Get-TableEntities -Table 'CostSnapshots' -Filter "PartitionKey eq 'cat|$($d.ToString('yyyy-MM-dd'))'" -Select 'PartitionKey,RowKey' -Top 1 -Token $Token)
+        if (-not $probe.Count) { return $false }
+    }
+    return $true
+}
+
 # Which complete periods exist in the retained snapshot window, and which still need rolling up.
 $retentionFloor = Get-PeriodRetentionFloorDays
 $scanFrom = $today.AddDays(-$retentionFloor)
-# Rollup format. 2 = one row per (resource, meter label) — see Update-PeriodRollup. A marker
+# Rollup format. 2 = one row per (resource, meter label) — see Update-PeriodRollup. 3 = plus the
+# creation-period spans (ResSpanDays / MeterSpanDays / SubSpanDays). A marker
 # from an older format is rebuilt while the month is still one detection reads (the target month
 # plus its baseline), so a format fix reaches the live comparison without a manual reset.
-$rollupVersion = 2
+$rollupVersion = 3
 $existingRollups = @{}
+$rollupHasCategories = @{}
 try {
-    foreach ($m in @(Get-TableEntities -Table 'PortalConfig' -Filter "PartitionKey eq 'rollup'" -Select 'RowKey,RollupVersion' -Token $storageToken)) {
+    foreach ($m in @(Get-TableEntities -Table 'PortalConfig' -Filter "PartitionKey eq 'rollup'" -Select 'RowKey,RollupVersion,Categories' -Token $storageToken)) {
         $existingRollups[[string]$m.RowKey] = if ($null -ne $m.RollupVersion) { [int]$m.RollupVersion } else { 1 }
+        $rollupHasCategories[[string]$m.RowKey] = [bool]$m.Categories
     }
 } catch { Write-Host "rollup marker read failed (periods may be recomputed): $($_.Exception.Message)" }
+
+# Adds the category rows to a month's rollup and records it on the marker (merge). The category
+# rollup can follow the resource rollup by days — the history refetch that supplies older months'
+# category totals runs after the nightly ingest — so a month without them is retried every night.
+function Add-MonthCategories {
+    param([string]$PeriodType, [string]$PeriodKey)
+    try {
+        $n = Update-PeriodCategoryRollup -PeriodType $PeriodType -PeriodKey $PeriodKey -Token $storageToken
+        if ($n -gt 0) {
+            Set-TableEntity -Table 'PortalConfig' -Token $storageToken -Entity @{ PartitionKey = 'rollup'; RowKey = "$PeriodType|$PeriodKey"; Categories = $true }
+            Write-Host "  rollup: $PeriodType $PeriodKey -> $n meter-category row(s)."
+        }
+    } catch { Write-Host "  rollup: category totals for $PeriodType $PeriodKey failed, will retry next run: $($_.Exception.Message)" }
+}
 
 # Only MONTHS are rolled up. The weekly grain is a trailing 7-day window whose bounds move
 # every night, so a cached calendar rollup would never be reused — it is computed directly
@@ -199,7 +297,14 @@ foreach ($periodType in $rollupTypes) {
     foreach ($pk in $complete) {
         $rk = "$periodType|$pk"
         if ($existingRollups.ContainsKey($rk)) {
-            if ($existingRollups[$rk] -ge $rollupVersion -or $pk -notin $inUse) { continue }
+            if ($existingRollups[$rk] -ge $rollupVersion -or $pk -notin $inUse) {
+                # Current resource rollup, but no category rows yet: add them once the ingest has them.
+                if ($pk -in $inUse -and -not $rollupHasCategories[$rk] -and
+                    (Test-PeriodHasCategories -PeriodType $periodType -PeriodKey $pk -Token $storageToken)) {
+                    Add-MonthCategories -PeriodType $periodType -PeriodKey $pk
+                }
+                continue
+            }
             Write-Host "  rollup: rebuilding $periodType $pk — stored in rollup format $($existingRollups[$rk]), current is $rollupVersion."
         }
         # Don't roll up a period whose start predates the retained snapshots — it would be
@@ -221,6 +326,11 @@ foreach ($periodType in $rollupTypes) {
                     Dimensions = $n; RollupVersion = $rollupVersion; At = ([datetime]::UtcNow.ToString('o'))
                 }
                 Write-Host "  rollup: $periodType $pk -> $n resource row(s)."
+                # The resource rollup replaced the whole partition, category rows included.
+                Set-TableEntity -Table 'PortalConfig' -Token $storageToken -Entity @{ PartitionKey = 'rollup'; RowKey = "$periodType|$pk"; Categories = $false }
+                if (Test-PeriodHasCategories -PeriodType $periodType -PeriodKey $pk -Token $storageToken) {
+                    Add-MonthCategories -PeriodType $periodType -PeriodKey $pk
+                }
             }
         } catch { Write-Host "  rollup: $periodType $pk failed, will retry next run: $($_.Exception.Message)" }
     }
@@ -259,6 +369,9 @@ function Get-PeriodRows {
         [PSCustomObject]@{
             Date = [string]$_.Period; DimensionKey = $_.DimensionKey
             Scope = $_.Scope; ResourceId = $_.ResourceId; Meter = $_.Meter; CostUsd = $_.CostUsd
+            ResSpanDays = $_.ResSpanDays; MeterSpanDays = $_.MeterSpanDays; SubSpanDays = $_.SubSpanDays
+            # 'category' = an exact meter-category total (Update-PeriodCategoryRollup); '' = a resource row.
+            Kind = [string]$_.Kind
         }
     })
 }
@@ -273,9 +386,13 @@ function Get-RollingWindowRows {
     $to   = @($Windows | Sort-Object End -Descending | Select-Object -First 1).End
     $acc = @{}
     $daysWithData = @{}
+    $catAcc = @{}; $catDays = @{}
+    # Per window: which days each resource / meter / subscription had cost (creation periods).
+    $masks = @{ res = @{}; meter = @{}; sub = @{}; cat = @{} }
     for ($d = $from; $d -le $to; $d = $d.AddDays(1)) {
         $w = @($Windows | Where-Object { $d -ge $_.Start -and $d -le $_.End }) | Select-Object -First 1
         if (-not $w) { continue }
+        $dayIndex = ($d - $w.Start).Days
         $dayKey = $d.ToString('yyyy-MM-dd')
         $rows = @(Get-TableEntities -Table 'CostSnapshots' -Filter "PartitionKey eq '$dayKey'" -Token $Token)
         # Coverage is judged on the unfiltered day (did the ingest run?), then the scope applies.
@@ -290,29 +407,72 @@ function Get-RollingWindowRows {
                     ResourceId = [string]$r.ResourceId; Meter = [string]$r.Meter; CostUsd = 0.0 }
             }
             $acc[$k].CostUsd += [double]$r.CostUsd
+            if ([double]$r.CostUsd -gt 0) {
+                Add-ActiveDay -Masks $masks.res -Key $k -DayIndex $dayIndex
+                Add-ActiveDay -Masks $masks.meter -Key "$($w.Key)|$(Get-DimensionKey -Dimension 'meter' -Scope ([string]$r.Scope) -Meter ([string]$r.Meter))" -DayIndex $dayIndex
+                Add-ActiveDay -Masks $masks.sub -Key "$($w.Key)|$(Get-DimensionKey -Dimension 'subscription' -Scope ([string]$r.Scope))" -DayIndex $dayIndex
+            }
+        }
+        # The day's exact per-category totals, for the meter grain (see Update-PeriodCategoryRollup).
+        $catRows = @(Get-TableEntities -Table 'CostSnapshots' -Filter "PartitionKey eq 'cat|$dayKey'" -Token $Token)
+        if ($catRows.Count) { $catDays[$dayKey] = $true }
+        foreach ($r in @(Select-InSubscriptionScope -Scope $subScope -Rows $catRows)) {
+            $dk = [string]$r.DimensionKey
+            if (-not $dk) { continue }
+            $k = "$($w.Key)|$dk"
+            if (-not $catAcc.ContainsKey($k)) {
+                $catAcc[$k] = [PSCustomObject]@{ Date = $w.Key; DimensionKey = $dk; Scope = [string]$r.Scope
+                    ResourceId = ''; Meter = [string]$r.Meter; CostUsd = 0.0; Kind = 'category' }
+            }
+            $catAcc[$k].CostUsd += [double]$r.CostUsd
+            if ([double]$r.CostUsd -gt 0) { Add-ActiveDay -Masks $masks.cat -Key $k -DayIndex $dayIndex }
         }
     }
+    foreach ($k in $catAcc.Keys) {
+        $row = $catAcc[$k]
+        $wDays = @($Windows | Where-Object { $_.Key -eq $row.Date } | ForEach-Object { ($_.End - $_.Start).Days + 1 })[0]
+        $row | Add-Member -NotePropertyName MeterSpanDays -NotePropertyValue (Get-StartedSpanDays -Mask ([long]($masks.cat[$k] ?? 0)) -DayCount $wDays) -Force
+    }
+    foreach ($row in $acc.Values) {
+        $wDays = @($Windows | Where-Object { $_.Key -eq $row.Date } | ForEach-Object { ($_.End - $_.Start).Days + 1 })[0]
+        $row | Add-Member -NotePropertyName ResSpanDays -NotePropertyValue (Get-StartedSpanDays -Mask ([long]($masks.res["$($row.Date)|$($row.DimensionKey)"] ?? 0)) -DayCount $wDays) -Force
+        $row | Add-Member -NotePropertyName MeterSpanDays -NotePropertyValue (Get-StartedSpanDays -Mask ([long]($masks.meter["$($row.Date)|$(Get-DimensionKey -Dimension 'meter' -Scope ([string]$row.Scope) -Meter ([string]$row.Meter))"] ?? 0)) -DayCount $wDays) -Force
+        $row | Add-Member -NotePropertyName SubSpanDays -NotePropertyValue (Get-StartedSpanDays -Mask ([long]($masks.sub["$($row.Date)|$(Get-DimensionKey -Dimension 'subscription' -Scope ([string]$row.Scope))"] ?? 0)) -DayCount $wDays) -Force
+    }
     $expected = ($to - $from).Days + 1
-    return [PSCustomObject]@{ Rows = @($acc.Values); DaysCovered = $daysWithData.Count; DaysExpected = $expected }
+    return [PSCustomObject]@{ Rows = @($acc.Values); DaysCovered = $daysWithData.Count; DaysExpected = $expected
+        # Category rows only count when EVERY day has them (else the meter grain keeps the labels).
+        CategoryRows = @($catAcc.Values); CategoryDaysCovered = $catDays.Count }
 }
 
 # Daily cost of a few keys across one period, from CostSnapshots one day at a time (the same
 # streaming as the rollup). Returns key -> double[days]; empty when a day cannot be read, since a
-# series with a hole would read as a drop to zero.
+# series with a hole would read as a drop to zero. Returns $null when a day cannot be read (so a
+# caller can tell "unknown" from "no cost"); a wanted key absent from a returned table had no
+# cost on any of the days.
+# -UseCategories: meter keys come from the day's category totals ('cat|' partition), the basis the
+# meter grain was detected on, instead of the resources' labels.
 function Get-PeriodDailySeries {
-    param([datetime]$Start, [datetime]$End, [string[]]$Keys, [string]$Token)
+    param([datetime]$Start, [datetime]$End, [string[]]$Keys, [string]$Token, [switch]$UseCategories)
     $wanted = @{}
     foreach ($k in $Keys) { if ($k) { $wanted[$k] = $true } }
     $n = ($End - $Start).Days + 1
     $series = @{}
     if (-not $wanted.Count) { return $series }
+    $needCat = $UseCategories -and @($wanted.Keys | Where-Object { $_ -like 'meter:*' }).Count -gt 0
     for ($i = 0; $i -lt $n; $i++) {
         $dayKey = $Start.AddDays($i).ToString('yyyy-MM-dd')
         try { $rows = @(Get-TableEntities -Table 'CostSnapshots' -Filter "PartitionKey eq '$dayKey'" -Token $Token) }
-        catch { Write-Host "  daily series: reading $dayKey failed, no within-period shape this run: $($_.Exception.Message)"; return @{} }
-        if (-not $rows.Count) { Write-Host "  daily series: no snapshots for $dayKey, no within-period shape this run."; return @{} }
+        catch { Write-Host "  daily series: reading $dayKey failed, no daily shape this run: $($_.Exception.Message)"; return $null }
+        if (-not $rows.Count) { Write-Host "  daily series: no snapshots for $dayKey, no daily shape this run."; return $null }
+        if ($needCat) {
+            try { $cat = @(Get-TableEntities -Table 'CostSnapshots' -Filter "PartitionKey eq 'cat|$dayKey'" -Token $Token) }
+            catch { Write-Host "  daily series: reading category totals for $dayKey failed, no daily shape this run: $($_.Exception.Message)"; return $null }
+            if (-not $cat.Count) { Write-Host "  daily series: no category totals for $dayKey, no daily shape this run."; return $null }
+            $rows = @($rows) + @($cat)
+        }
         $rows = @(Select-InSubscriptionScope -Scope $subScope -Rows $rows)
-        Add-DailySeriesRows -Series $series -Wanted $wanted -Rows $rows -DayIndex $i -DayCount $n
+        Add-DailySeriesRows -Series $series -Wanted $wanted -Rows $rows -DayIndex $i -DayCount $n -NoMeterLabels:$UseCategories
     }
     return $series
 }
@@ -344,6 +504,9 @@ function Set-AnalysisStatus {
 
 # --- weekly: trailing 7 days vs the 4 preceding non-overlapping 7-day windows ---
 $windowEnd = Get-RollingWindowEndDate -Today $today
+# "Where does it stand now" for every finding: the mean of the latest settled days (to D-2).
+$recentEnd = $windowEnd
+$recentDays = 3
 $windows = Get-RollingWindows -EndDate $windowEnd -WindowDays 7 -Count ((Get-PeriodBaselineCount -PeriodType 'week') + 1)
 $rolling = Get-RollingWindowRows -Windows $windows -Token $storageToken
 if ($rolling.DaysCovered -lt $rolling.DaysExpected) {
@@ -361,6 +524,9 @@ if ($rolling.DaysCovered -lt $rolling.DaysExpected) {
         Label       = "$($cur.Start.ToString('yyyy-MM-dd')) .. $($cur.End.ToString('yyyy-MM-dd'))"
         Current     = @($rolling.Rows | Where-Object { $_.Date -eq $cur.Key })
         Baseline    = @($rolling.Rows | Where-Object { $_.Date -ne $cur.Key })
+        CurrentCategories  = @($rolling.CategoryRows | Where-Object { $_.Date -eq $cur.Key })
+        BaselineCategories = @($rolling.CategoryRows | Where-Object { $_.Date -ne $cur.Key })
+        UseCategories = ($rolling.CategoryDaysCovered -ge $rolling.DaysExpected)
         BaselineN   = $windows.Count - 1
         # For the evidence queries: the same windows detection compared against.
         BaselineRanges = @($windows | Where-Object { $_.Index -gt 0 } | ForEach-Object { @{ Start = $_.Start; End = $_.End } })
@@ -388,14 +554,25 @@ if ($monthKeys.Count -lt 2) {
     $bounds = Get-PeriodBounds -PeriodKey $targetKey -PeriodType 'month'
     $baseRows = @()
     foreach ($bk in $baselineKeys) { $baseRows += Get-PeriodRows -PeriodType 'month' -PeriodKey $bk -Token $storageToken }
+    $curRows = @(Get-PeriodRows -PeriodType 'month' -PeriodKey $targetKey -Token $storageToken)
+    # The rollup partition holds resource rows and (once the ingest supplied them) category rows.
+    $curCat  = @($curRows | Where-Object { $_.Kind -eq 'category' })
+    $baseCat = @($baseRows | Where-Object { $_.Kind -eq 'category' })
+    # Category basis only when the analysed month AND every baseline month have it: comparing an
+    # exact category total with a label-based one would flag the method change, not the cost.
+    $catMonths = @{}; foreach ($r in $baseCat) { $catMonths[[string]$r.Date] = $true }
+    $useCat = $curCat.Count -gt 0 -and @($baselineKeys | Where-Object { -not $catMonths.ContainsKey([string]$_) }).Count -eq 0
     $analyses += [PSCustomObject]@{
         PeriodType  = 'month'
         Key         = $targetKey
         Start       = $bounds.Start
         End         = $bounds.End
         Label       = $targetKey
-        Current     = Get-PeriodRows -PeriodType 'month' -PeriodKey $targetKey -Token $storageToken
-        Baseline    = $baseRows
+        Current     = @($curRows | Where-Object { $_.Kind -ne 'category' })
+        Baseline    = @($baseRows | Where-Object { $_.Kind -ne 'category' })
+        CurrentCategories  = $curCat
+        BaselineCategories = $baseCat
+        UseCategories = $useCat
         BaselineN   = $baselineKeys.Count
         BaselineRanges = @($baselineKeys | ForEach-Object { $mb = Get-PeriodBounds -PeriodKey $_ -PeriodType 'month'; @{ Start = $mb.Start; End = $mb.End } })
         Granularity = 'Monthly'
@@ -411,6 +588,9 @@ foreach ($a in $analyses) {
 
     $currentRows  = @($a.Current)
     $baselineRows = @($a.Baseline)
+    # A baseline period the key was created in counts at its daily level x this many days
+    # (Measure-DimensionBaseline -ScaleStartedTo); one it started in its last 2 days is left out.
+    $analysisDays = ($a.End - $a.Start).Days + 1
     if (-not $currentRows.Count) {
         Write-Host "  no rows for $targetKey — skipping."
         Set-AnalysisStatus -PeriodType $periodType -Status 'skipped' -Period $targetKey -Reason 'no-data' -Detail (
@@ -421,13 +601,20 @@ foreach ($a in $analyses) {
     # -Dimension keys inline rather than building a re-keyed copy of every row first: three
     # dimensions over several periods made those copies the largest thing in memory.
     $current  = Measure-DailyDimensionCost -Rows $currentRows  -Dimension 'resource'
-    $baseline = Measure-DimensionBaseline  -Rows $baselineRows -Dimension 'resource'
+    $baseline = Measure-DimensionBaseline  -Rows $baselineRows -Dimension 'resource' -ScaleStartedTo $analysisDays
     $findings = @(Find-CostSpike -Current $current -Baseline $baseline -MinDeltaUsd $minUsd -MinDeltaPct $minPct -Dimension 'resource')
     Write-Host "  resource grain: $($findings.Count) finding(s)."
 
+    # The meter grain: exact per-category totals when every period has them, otherwise each
+    # resource's largest category (the label basis, which misses cost spread thinly over many
+    # resources — a VM's Defender plan counts as 'Virtual Machines').
+    $useCat = [bool]$a.UseCategories
+    Write-Host "  meter basis: $(if ($useCat) { 'exact meter-category totals' } else { 'largest category per resource (category totals not available for every period yet)' })."
     foreach ($dim in @('meter', 'subscription')) {
-        $dimCurrent  = Measure-DailyDimensionCost -Rows $currentRows  -Dimension $dim
-        $dimBaseline = Measure-DimensionBaseline  -Rows $baselineRows -Dimension $dim
+        $dimCurRows  = if ($dim -eq 'meter' -and $useCat) { @($a.CurrentCategories) } else { $currentRows }
+        $dimBaseRows = if ($dim -eq 'meter' -and $useCat) { @($a.BaselineCategories) } else { $baselineRows }
+        $dimCurrent  = Measure-DailyDimensionCost -Rows $dimCurRows  -Dimension $dim
+        $dimBaseline = Measure-DimensionBaseline  -Rows $dimBaseRows -Dimension $dim -ScaleStartedTo $analysisDays
         $found = @(Find-CostSpike -Current $dimCurrent -Baseline $dimBaseline -MinDeltaUsd $minUsd -MinDeltaPct $minPct -Dimension $dim)
         $kept  = @(Select-UnexplainedSpike -RollupSpikes $found -ResourceSpikes $findings -MinDeltaUsd $minUsd)
         Write-Host "  $dim grain: $($found.Count) flagged, $($kept.Count) not already explained by a resource finding."
@@ -435,33 +622,86 @@ foreach ($a in $analyses) {
     }
     $findings = @($findings | Sort-Object -Property DeltaUsd -Descending)
 
-    # --- how each monthly finding moved WITHIN the month ---
-    # A month is compared as one total, so a service that ran at full cost for twelve days and
-    # was then switched off still reads as "more than a typical month". The daily shape says
-    # where the month ENDED: when that level would not be flagged, the increase has already
-    # fallen back and the finding is marked Resolved instead of being shown as open.
-    if ($periodType -eq 'month' -and $findings.Count) {
+    # --- how each finding moved WITHIN the period, and where it stands NOW ---
+    # A period is compared as one total, so a service that ran at full cost for twelve days and
+    # was then switched off still reads as "more than a typical month" — and a trailing week
+    # keeps the high days in its window for up to 7 nights after the cost fell. Two measures fix
+    # what the reader sees:
+    #   shape    the period's daily series: where it ENDED and on which day it stepped down
+    #            (Measure-ExitRunRate; the week uses a 3-day tail, the month a 7-day one).
+    #   current  the mean of the latest $recentDays settled days (up to D-2) — after the period
+    #            for a closed month — scaled to a whole period and judged against the same bar
+    #            (Get-FindingState): resolved / decreasing / open.
+    if ($findings.Count) {
+        $periodDays = ($a.End - $a.Start).Days + 1
+        $keys = @($findings | ForEach-Object { [string]$_.DimensionKey })
         $coverage = @{}
-        foreach ($dim in @('resource', 'meter', 'subscription')) { $coverage[$dim] = Measure-BaselineCoverage -Rows $baselineRows -Dimension $dim }
-        $series = Get-PeriodDailySeries -Start $a.Start -End $a.End -Keys @($findings | ForEach-Object { [string]$_.DimensionKey }) -Token $storageToken
-        $resolvedCount = 0
-        foreach ($f in $findings) {
-            $cov = $coverage[[string]$f.Dimension]
-            $f | Add-Member -NotePropertyName BaselinePeriods -NotePropertyValue $(if ($cov -and $cov.ContainsKey([string]$f.DimensionKey)) { [int]$cov[[string]$f.DimensionKey] } else { 0 }) -Force
-            $f | Add-Member -NotePropertyName BaselinePeriodsOf -NotePropertyValue ([int]$a.BaselineN) -Force
-            $daily = $series[[string]$f.DimensionKey]
-            if (-not $daily) { continue }
-            $m = Measure-ExitRunRate -Daily $daily
-            if (-not $m) { continue }
-            $resolved = Test-ExitRunRateResolved -ExitRunRateUsd $m.ExitRunRateUsd -BaselineUsd ([double]$f.BaselineUsd) -MinDeltaUsd $minUsd -MinDeltaPct $minPct
-            if ($resolved) { $resolvedCount++ }
-            $f | Add-Member -NotePropertyName ExitRunRateUsd -NotePropertyValue ([double]$m.ExitRunRateUsd) -Force
-            $f | Add-Member -NotePropertyName SteppedDownOn -NotePropertyValue $(if ($null -ne $m.StepDownIndex) { $a.Start.AddDays($m.StepDownIndex).ToString('yyyy-MM-dd') } else { '' }) -Force
-            $f | Add-Member -NotePropertyName DailyBeforeUsd -NotePropertyValue $m.BeforeDailyUsd -Force
-            $f | Add-Member -NotePropertyName DailyAfterUsd -NotePropertyValue $m.AfterDailyUsd -Force
-            $f | Add-Member -NotePropertyName Resolved -NotePropertyValue ([bool]$resolved) -Force
+        foreach ($dim in @('resource', 'meter', 'subscription')) {
+            $covRows = if ($dim -eq 'meter' -and $useCat) { @($a.BaselineCategories) } else { $baselineRows }
+            $coverage[$dim] = Measure-BaselineCoverage -Rows $covRows -Dimension $dim -MinStartedSpan 3
         }
-        Write-Host "  within-month shape: $($series.Count) of $($findings.Count) finding(s) measured, $resolvedCount already back below the bar at month end."
+        $series = Get-PeriodDailySeries -Start $a.Start -End $a.End -Keys $keys -Token $storageToken -UseCategories:$useCat
+        # The recent days. When the period itself reaches them (the trailing week always does),
+        # its own tail is used; otherwise they are read separately — only a few days of snapshots.
+        $recentSeries = $null; $recentAsOf = $null; $recentFromTail = $false
+        if ($a.End -ge $recentEnd) {
+            $recentSeries = $series; $recentAsOf = $a.End; $recentFromTail = $true
+        } else {
+            $recentSeries = Get-PeriodDailySeries -Start $recentEnd.AddDays(-($recentDays - 1)) -End $recentEnd -Keys $keys -Token $storageToken -UseCategories:$useCat
+            $recentAsOf = $recentEnd
+        }
+        $tailDays = if ($periodType -eq 'week') { 3 } else { 7 }
+        $minSegment = if ($periodType -eq 'week') { 2 } else { 3 }
+        $counts = @{ open = 0; decreasing = 0; resolved = 0; unknown = 0 }
+        foreach ($f in $findings) {
+            $k = [string]$f.DimensionKey
+            $cov = $coverage[[string]$f.Dimension]
+            $f | Add-Member -NotePropertyName BaselinePeriods -NotePropertyValue $(if ($cov -and $cov.ContainsKey($k)) { [int]$cov[$k] } else { 0 }) -Force
+            $f | Add-Member -NotePropertyName BaselinePeriodsOf -NotePropertyValue ([int]$a.BaselineN) -Force
+
+            $endResolved = $false
+            if ($null -ne $series) {
+                # A key the read found no cost for at all: an all-zero period (cannot happen for a
+                # finding, but must not crash).
+                $daily = if ($series.ContainsKey($k)) { $series[$k] } else { [double[]]::new($periodDays) }
+                $m = Measure-ExitRunRate -Daily $daily -TailDays $tailDays -MinSegmentDays $minSegment
+                if ($m) {
+                    $endResolved = Test-ExitRunRateResolved -ExitRunRateUsd $m.ExitRunRateUsd -BaselineUsd ([double]$f.BaselineUsd) -MinDeltaUsd $minUsd -MinDeltaPct $minPct
+                    $f | Add-Member -NotePropertyName ExitRunRateUsd -NotePropertyValue ([double]$m.ExitRunRateUsd) -Force
+                    $f | Add-Member -NotePropertyName SteppedDownOn -NotePropertyValue $(if ($null -ne $m.StepDownIndex) { $a.Start.AddDays($m.StepDownIndex).ToString('yyyy-MM-dd') } else { '' }) -Force
+                    $f | Add-Member -NotePropertyName DailyBeforeUsd -NotePropertyValue $m.BeforeDailyUsd -Force
+                    $f | Add-Member -NotePropertyName DailyAfterUsd -NotePropertyValue $m.AfterDailyUsd -Force
+                }
+            }
+
+            $recentDaily = $null
+            if ($null -ne $recentSeries) {
+                $vals = if ($recentSeries.ContainsKey($k)) { @($recentSeries[$k]) } else { @() }
+                if ($recentFromTail) { $vals = @($vals | Select-Object -Last $recentDays) }
+                $sum = 0.0; foreach ($v in $vals) { $sum += [double]$v }
+                # Missing key = no cost on those days.
+                $recentDaily = $sum / $recentDays
+            }
+            $state = Get-FindingState -RecentDailyUsd $recentDaily -PeriodDays $periodDays -BaselineUsd ([double]$f.BaselineUsd) `
+                -SpikeUsd ([double]$f.SpikeUsd) -MinDeltaUsd $minUsd -MinDeltaPct $minPct
+            # A month that already ended below the bar stays resolved even if a later blip lifts
+            # the recent days a little — it was resolved within the period it describes.
+            if ($endResolved -and $state -ne 'resolved') { $state = 'resolved' }
+            if ($null -eq $recentDaily) { $counts.unknown++ } else { $counts[$state]++ }
+            $f | Add-Member -NotePropertyName State -NotePropertyValue $state -Force
+            $f | Add-Member -NotePropertyName Resolved -NotePropertyValue ($state -eq 'resolved') -Force
+            $f | Add-Member -NotePropertyName CurrentDailyUsd -NotePropertyValue $recentDaily -Force
+            $f | Add-Member -NotePropertyName CurrentAsOf -NotePropertyValue $(if ($null -ne $recentDaily) { $recentAsOf.ToString('yyyy-MM-dd') } else { '' }) -Force
+            # How far it has fallen, and since when (Get-CostFall) — only for changes that are no
+            # longer running high.
+            $fall = if ($state -ne 'open') {
+                Get-CostFall -CurrentDailyUsd $recentDaily -BeforeDailyUsd $f.DailyBeforeUsd -SteppedDownOn ([string]$f.SteppedDownOn) `
+                    -SpikeUsd ([double]$f.SpikeUsd) -PeriodDays $periodDays
+            } else { $null }
+            $f | Add-Member -NotePropertyName Fall -NotePropertyValue $fall -Force
+        }
+        Write-Host ("  current level (last $recentDays settled days to $($recentAsOf.ToString('yyyy-MM-dd'))): " +
+            "$($counts.open) open, $($counts.decreasing) decreasing, $($counts.resolved) resolved, $($counts.unknown) not measurable.")
     }
 
     foreach ($f in $findings) {
@@ -609,6 +849,16 @@ foreach ($a in $analyses) {
             ExitRunRateUsd = if ($null -ne $f.ExitRunRateUsd) { [Math]::Round([double]$f.ExitRunRateUsd, 2) } else { -1 }
             SteppedDownOn  = if ($f.SteppedDownOn) { [string]$f.SteppedDownOn } else { '' }
             Resolved       = [bool]$f.Resolved
+            # Where it stands NOW (Get-FindingState): open | decreasing | resolved, from the mean of
+            # the latest settled days. -1 / '' = not measurable this run.
+            State          = if ($f.State) { [string]$f.State } else { 'open' }
+            CurrentDailyUsd = if ($null -ne $f.CurrentDailyUsd) { [Math]::Round([double]$f.CurrentDailyUsd, 2) } else { -1 }
+            CurrentAsOf    = if ($f.CurrentAsOf) { [string]$f.CurrentAsOf } else { '' }
+            # The fall in daily cost (negative %), from FallFromDailyUsd, since FallSince ('' = against
+            # the period's average day). 0 / -1 / '' = no fall measured.
+            FallPct        = if ($f.Fall) { [double]$f.Fall.Pct } else { 0 }
+            FallFromDailyUsd = if ($f.Fall) { [double]$f.Fall.FromDailyUsd } else { -1 }
+            FallSince      = if ($f.Fall) { [string]$f.Fall.Since } else { '' }
             BaselinePeriods   = if ($null -ne $f.BaselinePeriods) { [int]$f.BaselinePeriods } else { -1 }
             BaselinePeriodsOf = if ($null -ne $f.BaselinePeriodsOf) { [int]$f.BaselinePeriodsOf } else { -1 }
             # Written as '' rather than left out: a MERGE keeps an omitted (or null) property,
@@ -628,13 +878,30 @@ foreach ($a in $analyses) {
             EvidenceJson   = $evidenceJson
             EvidenceStatus = if ($evidenceStatus.ContainsKey($f.Id)) { [string]$evidenceStatus[$f.Id] } else { 'none' }
             Kind           = 'usage'
-            Status         = 'open'
+            Status         = if ($f.State) { [string]$f.State } else { 'open' }
             DetectedAt     = ([datetime]::UtcNow.ToString('o'))
         }
     }
     Set-TableEntityBatch -Table 'CostSpikes' -Entities $entities -Token $storageToken
     Write-Host ("$periodType : persisted $($entities.Count) finding(s) for $($a.Label) — evidence gathered $evGathered, reused $evReused, skipped $evSkipped; " +
                 "explained $narrated, reused $reused, failed $failed.")
+
+    # A period is re-analysed every night while it is the newest of its grain, and a finding an
+    # earlier run produced may no longer be one (a baseline that caught up, a rollup now covered by
+    # a resource finding, a changed detection rule). Upserting alone left those rows in the
+    # partition, frozen with old figures and evidence. This run is the whole answer for the
+    # period, so every stored row it did not write goes. Skipped when the stored rows could not be
+    # read ($storedNarratives empty), which only means nothing is removed.
+    $written = @{}
+    foreach ($e in $entities) { $written[[string]$e.RowKey] = $true }
+    $stale = @($storedNarratives.Keys | Where-Object { -not $written.ContainsKey([string]$_) } |
+        ForEach-Object { @{ PartitionKey = "$periodType|$targetKey"; RowKey = [string]$_ } })
+    if ($stale.Count) {
+        try {
+            $n = Remove-TableEntityBatch -Table 'CostSpikes' -Entities $stale -Token $storageToken
+            Write-Host "$periodType : removed $n finding(s) for $($a.Label) that this run no longer flags."
+        } catch { Write-Host "$periodType : removing stale findings failed (they stay until the next run): $($_.Exception.Message)" }
+    }
 
     # Pointer to the newest analysed window, so GetCostSpikes doesn't have to guess which one
     # exists — the rolling window's bounds move every night.
@@ -653,6 +920,10 @@ foreach ($a in $analyses) {
         PeriodType = $periodType; Period = $targetKey
         PeriodStart = $bounds.Start.ToString('yyyy-MM-dd'); PeriodEnd = $bounds.End.ToString('yyyy-MM-dd')
         FindingCount = @($entities).Count
+        # What the page needs to explain the comparison: which windows / months formed the
+        # baseline, and how fresh the "current level" of each finding is.
+        BaselineRangesJson = (@($a.BaselineRanges | ForEach-Object { @{ start = $_.Start.ToString('yyyy-MM-dd'); end = $_.End.ToString('yyyy-MM-dd') } }) | ConvertTo-Json -Compress -AsArray)
+        SettledThrough = $recentEnd.ToString('yyyy-MM-dd')
         At = ([datetime]::UtcNow.ToString('o'))
     }
     Set-AnalysisStatus -PeriodType $periodType -Status 'ok' -Period $targetKey

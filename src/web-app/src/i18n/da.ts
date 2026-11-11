@@ -238,6 +238,7 @@ export const da: Messages = {
     usedLast: (days) => `Ressourcer der har brugt den — seneste ${days} dage`,
     askWhich: (name) => `Hvilke ressourcer bruger ${name}, og har den den rigtige størrelse?`,
     noUsage: 'Ingen forbrugsdata for denne forpligtelse endnu. De vises efter den natlige synkronisering, når Azure har amortiserede omkostninger for den.',
+    costHidden: 'Azure oplyser ikke noget beløb for det forbrug, aftalen dækker, på denne tenant. Andelene nedenfor er derfor efter forbrug (timer eller enheder), og det dækkede beløb vises ikke.',
     idleWarn: (lastUsed) => `Intet har brugt den de seneste 7 dage${lastUsed ? ` (sidst brugt ${lastUsed})` : ''}. Tjek om dens ressourcer er ændret i størrelse, flyttet eller slettet.`,
     resourcesUsing: (name) => `Ressourcer der bruger ${name}`,
     resource: 'Ressource',
@@ -289,6 +290,13 @@ export const da: Messages = {
       `I løbet af perioden: den daglige omkostning faldt d. ${day} fra ca. ${before} til ca. ${after}; den sluttede på ${end} for en hel periode.`,
     shapeEnd: (end) => `I løbet af perioden: den sluttede på ${end} for en hel periode.`,
     shapeResolved: 'Det er under grænsen igen — stigningen er allerede faldet tilbage.',
+    shapeNow: (state, level, asOf) =>
+      `Nu: ${level} pr. periode over de seneste afregnede dage til ${asOf}${state === 'resolved' ? ' — tilbage på normalt niveau.' : state === 'decreasing' ? ' — på vej ned.' : ' — stadig højt.'}`,
+    basis: (n, week) =>
+      `Sammenlignet med gennemsnittet af ${week ? `de ${n} foregående 7-dagesperioder` : `de ${n} foregående måneder`}${n > 2 ? ' (selve registreringen bruger medianen, så totalerne kan afvige lidt)' : ''}.`,
+    spread: (n, top) => `Stigningen er fordelt på ${n} ressourcer; den største står for ${top} % af den.`,
+    spreadThin: 'Ingen enkelt ressource forårsagede den — se på målerne ovenfor og på indstillinger på abonnementsniveau.',
+    meterOrResource: 'Måler / ressource',
     isNew: 'ny',
     unitPrice: (p) => `enhedspris ${p}`,
     usage: (p) => `forbrug ${p}`,
@@ -439,7 +447,8 @@ export const da: Messages = {
       resourceId: 'Ressource-ID', meter: 'Målerkategori', allocation: 'Fordeling', typical: (c) => `Typisk (${c})`,
       thisPeriod: (c) => `Denne periode (${c})`, increase: (c) => `Stigning (${c})`, increasePct: 'Stigning %',
       newSpend: 'Nyt forbrug', drove: 'Hvad drev det', explanation: 'Forklaring', explained: 'Forklaret af dokumentation', nextStep: 'Næste skridt',
-      alreadyFell: 'Allerede faldet', endLevel: (c) => `Niveau ved månedens slutning (${c})`,
+      alreadyFell: 'Allerede faldet', endLevel: (c) => `Niveau ved periodens slutning (${c})`,
+      state: 'Status', currentLevel: (c) => `Aktuelt niveau pr. periode (${c})`, currentAsOf: 'Aktuelt niveau pr. dato', fallPct: 'Fald %', fallSince: 'Faldende siden',
     },
     loading: 'Indlæser omkostningsændringer…',
     noPeriod: (month) => `Ingen hel ${month ? 'måned' : 'uge'} er analyseret endnu — fund vises, når en periode er slut og den natlige kørsel har behandlet den.`,
@@ -462,8 +471,46 @@ export const da: Messages = {
     newSpend: 'nyt forbrug',
     spread: 'fordelt på ressourcer',
     alreadyFell: 'allerede faldet',
-    alreadyFellHint: 'Månedens total var højere, men omkostningen var tilbage på normalt niveau, da måneden sluttede.',
-    endLevel: 'Niveau ved månedens slutning',
+    alreadyFellHint: 'Periodens total var højere, men omkostningen var tilbage på normalt niveau, da perioden sluttede.',
+    endLevel: 'Niveau ved periodens slutning',
+    stateResolved: 'Løst',
+    stateResolvedSince: (date) => `Løst – faldende siden ${date}`,
+    stateDecreasing: 'Faldende',
+    linkedPeriod: (period) => `Viser ${period} — den periode, fundet på Overblik bygger på.`,
+    linkedMissing: 'Ændringen findes ikke længere på listen for denne periode.',
+    showNewest: 'Vis nyeste',
+    fallSince: (pct, date) => `${pct} siden ${date}`,
+    fallVsAverage: (pct) => `${pct} ift. periodens gennemsnit`,
+    fallLabel: (date) => (date ? `Fald siden ${date}` : 'Fald ift. periodens gennemsnit'),
+    fallHint: (from, to, date) =>
+      `Den daglige omkostning faldt fra ${from} til ${to} pr. dag${date ? ` siden ${date}` : ' i forhold til periodens gennemsnitsdag'} (seneste afregnede dage)`,
+    resolvedHint: 'I de seneste afregnede dage ligger omkostningen på et niveau, der ikke længere ville blive vist. Fundet bliver stående (nedtonet), indtil perioden ikke længere er den nyeste.',
+    decreasingHint: 'Stadig over grænsen, men de seneste afregnede dage ligger klart under periodens gennemsnit — omkostningen falder.',
+    currentLevel: 'Aktuelt niveau',
+    currentLevelHint: (days, date) => `Gennemsnit af de ${days} afregnede dage til og med ${date}, omregnet til en hel periode`,
+    hideResolved: 'Skjul løste',
+    howTitle: 'Sådan beregnes fundene',
+    how: {
+      periodWeek: (range, settled, lag) =>
+        `Analyseret periode: de seneste 7 dage ${range}. De sidste ${lag} dage udelades, fordi Azure stadig retter dem — data er afregnet til og med ${settled}. Vinduet rykker frem hver nat.`,
+      periodMonth: (month) =>
+        `Analyseret periode: hele kalendermåneden ${month}. En måned analyseres først, når den er slut, og den gentjekkes hver nat, indtil den næste måned lukker.`,
+      compared: (n, week, list) =>
+        `Sammenlignet med: ${week ? 'typiske 7 dage' : 'en typisk måned'} — medianen af de ${n} foregående ${week ? 'ikke-overlappende 7-dages vinduer' : 'hele måneder'}${list ? ` (${list})` : ''}. Medianen ser bort fra en enkelt usædvanlig periode. Forbrug uden basislinje tæller som nyt forbrug.`,
+      bar: (amount, week, pct) =>
+        `Vises når: perioden koster mindst ${amount} mere pr. ${week ? 'uge' : 'måned'} OG mindst ${pct}% mere end typisk. Totaler pr. målerkategori og abonnement tjekkes også, så stigninger fordelt på mange ressourcer bliver fanget.`,
+      current: (days, settled) =>
+        `Aktuelt niveau: hvert fund måles også over de seneste ${days} afregnede dage (til og med ${settled}), omregnet til en hel periode. For en afsluttet måned er det dagene efter den.`,
+      resolves:
+        'Løses automatisk når: det aktuelle niveau ikke længere ville overskride grænsen. Det markeres som “Løst” ved næste natlige kørsel (~02:40 UTC) — der er ingen grund til at vente på, at de dyre dage forlader perioden. “Faldende” betyder klart faldende, men endnu ikke under grænsen.',
+      baseline: (week) => week
+        ? 'Bliver det nye normale: hvis den højere omkostning fortsætter, kommer den ind i basislinjens vinduer én uge ad gangen. Når den dominerer medianen — efter ca. 3 uger — er den “typisk” og vises ikke længere.'
+        : 'Bliver det nye normale: hvis den højere omkostning fortsætter, sammenlignes næste måned stadig mest med ældre måneder og vises igen; fra måneden derefter er medianen det nye niveau, og den vises ikke længere (ca. 2 måneder).',
+      removed: (week) => week
+        ? 'Fjernes: intet fjernes manuelt. Siden viser det nyeste vindue, genberegnet hver nat; et fund forsvinder, når de seneste 7 dage ikke længere overskrider grænsen. Ældre vinduer findes under “Tidligere”.'
+        : 'Fjernes: intet fjernes manuelt. Siden viser den nyeste hele måned; når næste måned lukker, vises et fund kun igen, hvis den måned også overskrider grænsen. Ældre måneder findes under “Tidligere”.',
+      analysedAt: (when) => `Senest analyseret: ${when}.`,
+    },
     fellOn: (date) => `faldt d. ${date}`,
     typicalOf: (n, of) => ` (${n} af ${of} mdr.)`,
     typicalWeek: 'Typiske 7 dage',

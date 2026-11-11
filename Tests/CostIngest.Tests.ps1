@@ -34,14 +34,17 @@ function global:Get-SubscriptionDailyCost {
     if ($global:FailSubs[$SubscriptionId] -gt 0) { $global:FailSubs[$SubscriptionId]--; throw 'COST_QUERY_THROTTLED: test throttle' }
     if ($global:FailHistorySub -eq $SubscriptionId -and $To -lt [datetime]::UtcNow.Date.AddDays(-9)) { throw 'COST_QUERY_THROTTLED: history throttle' }
     $perDay = if ($SubscriptionId -eq $subB) { 1000.0 } else { 10.0 }
-    $rows = @(); $days = @{}
+    $rows = @(); $cats = @(); $days = @{}
     for ($d = $From.Date; $d -le $To.Date; $d = $d.AddDays(1)) {
         $k = $d.ToString('yyyy-MM-dd')
         $rows += [PSCustomObject]@{ Date = $k; ResourceId = "/subscriptions/$SubscriptionId/resourcegroups/rg/providers/microsoft.compute/virtualmachines/vm1"
                                     Scope = $SubscriptionId; Meter = 'Virtual Machines'; CostUsd = $perDay }
+        # The VM's cost split by category: 90% compute, 10% a Defender plan.
+        $cats += [PSCustomObject]@{ Date = $k; Scope = $SubscriptionId; Meter = 'Virtual Machines'; CostUsd = $perDay * 0.9 }
+        $cats += [PSCustomObject]@{ Date = $k; Scope = $SubscriptionId; Meter = 'Microsoft Defender for Cloud'; CostUsd = $perDay * 0.1 }
         $days[$k] = @{ Usd = $perDay; Billing = $perDay * 7; Currency = 'EUR' }
     }
-    return @{ Rows = $rows; Days = $days; Currency = 'EUR' }
+    return @{ Rows = $rows; CategoryRows = $cats; Days = $days; Currency = 'EUR' }
 }
 
 # --- the queue ------------------------------------------------------------------------------------
@@ -107,6 +110,11 @@ Test-That 'the last task completes the run: day totals, month rows, snapshots an
     Assert-Equal 'EUR' $mk.BillingCurrency 'billing currency recorded for SyncAdvisor'
     Assert-Equal $today.ToString('yyyy-MM-dd') ([datetime]$mk.At).ToUniversalTime().ToString('yyyy-MM-dd') 'today, so the detectors see it'
     Assert-Equal 2 @($global:Store['CostSnapshots'].Values | Where-Object { $_.PartitionKey -eq $day }).Count 'one resource row per subscription'
+    $cat = @($global:Store['CostSnapshots'].Values | Where-Object { $_.PartitionKey -eq "cat|$day" })
+    Assert-Equal 4 $cat.Count 'one category row per subscription and category, in its own partition'
+    $def = @($cat | Where-Object { $_.Scope -eq $subB -and $_.Meter -eq 'Microsoft Defender for Cloud' })[0]
+    Assert-Equal 100.0 $def.CostUsd 'exact category total'
+    Assert-Equal (Get-DimensionKey -Dimension 'meter' -Scope $subB -Meter 'Microsoft Defender for Cloud') $def.DimensionKey 'keyed like the meter grain'
     Assert-Equal 'done' (Get-Row 'PortalConfig' 'ingestrun|current').Status 'run closed'
     Assert-True (@($global:Queue | Where-Object { $_.Message.kind -eq 'history' }).Count -eq 1) 'history queued once the run is done'
 }
@@ -178,6 +186,38 @@ Test-That 'history loads one month per task for every subscription, newest first
     $calls = $global:CostCalls.Count
     Assert-Equal 'complete' (Invoke-CostIngestPlanner -StorageToken 't' -MgmtToken 'm' -Now $now) 'nothing left'
     Assert-Equal $calls $global:CostCalls.Count 'no query'
+    Assert-True ([bool]$st.CategoryTotals) 'history marked as carrying category totals'
+    Assert-True ($null -ne (Get-Row 'CostSnapshots' "cat|$old|$(Get-ShortHash -Value "$subA|Microsoft Defender for Cloud")")) 'an old day has its category totals'
+}
+Test-That 'history stored before category totals is fetched once more, then left alone' {
+    Reset-Ingest
+    $null = Invoke-CostIngestPlanner -StorageToken 't' -MgmtToken 'm' -Now $now
+    Invoke-Drain
+    # As an older version left it: complete, no CategoryTotals flag.
+    $global:Store['PortalConfig']['backfill|history'].Remove('CategoryTotals')
+    $global:CostCalls.Clear()
+    $null = Update-CostHistoryPlan -StorageToken 't' -Today $today
+    Invoke-Drain
+    Assert-True (@($global:CostCalls | Where-Object Sub -eq $subA).Count -gt 0) 'refetched'
+    $st = Get-Row 'PortalConfig' 'backfill|history'
+    Assert-True ([bool]$st.CategoryTotals -and [bool]$st.Complete) 'complete with category totals'
+    $global:CostCalls.Clear()
+    Assert-Equal 'complete' (Update-CostHistoryPlan -StorageToken 't' -Today $today) 'only once'
+    Assert-Equal 0 $global:CostCalls.Count 'no further query'
+}
+Test-That 'retention prunes old category partitions with the per-resource ones' {
+    Reset-Ingest
+    $w = Get-CostIngestWindow -StorageToken 't' -Today $today
+    $old = $w.To.AddDays(-($w.EffectiveRetention + 5)).ToString('yyyy-MM-dd')
+    $keep = $w.To.AddDays(-3).ToString('yyyy-MM-dd')
+    foreach ($d in @($old, $keep)) {
+        Set-TableEntity -Table 'CostSnapshots' -Entity @{ PartitionKey = "cat|$d"; RowKey = 'a'; Kind = 'category'; CostUsd = 1.0 }
+        Set-TableEntity -Table 'CostSnapshots' -Entity @{ PartitionKey = $d; RowKey = 'r'; CostUsd = 1.0 }
+    }
+    & (Get-Module CostIngest) { param($w) Invoke-SnapshotRetention -StorageToken 't' -Window $w } $w *> $null
+    Assert-True ($null -eq (Get-Row 'CostSnapshots' "cat|$old|a")) 'old category row gone'
+    Assert-True ($null -eq (Get-Row 'CostSnapshots' "$old|r")) 'old resource row gone'
+    Assert-True ($null -ne (Get-Row 'CostSnapshots' "cat|$keep|a")) 'recent category row kept'
 }
 Test-That 'a history month one subscription fails writes nothing for that month' {
     Reset-Ingest
@@ -250,6 +290,9 @@ Test-That 'per-resource query: charges without a resource count in the day total
     Assert-Equal 1 @($r.Rows).Count 'one resource row'
     Assert-Equal 42.0 @($r.Rows)[0].CostUsd 'meters summed per resource'
     Assert-Equal 'Virtual Machines' @($r.Rows)[0].Meter 'costliest meter as the label'
+    $cats = @($r.CategoryRows)
+    Assert-Equal 2 $cats.Count 'one row per category with resource cost (unattributed Support left out)'
+    Assert-Equal 12.0 @($cats | Where-Object Meter -eq 'Bandwidth')[0].CostUsd 'a smaller category keeps its own total'
     Assert-Equal 47.0 $r.Days['2026-10-01'].Usd 'day total includes the unattributed 5'
     Assert-Equal 330.0 $r.Days['2026-10-01'].Billing 'billing currency from its own query'
     Assert-Equal 'DKK' $r.Currency 'currency'

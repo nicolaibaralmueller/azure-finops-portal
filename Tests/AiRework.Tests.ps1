@@ -155,28 +155,53 @@ Test-That 'an expired deadline skips the queries' {
     Assert-Equal 0 $global:CostQueryBodies.Count 'no queries'
     Assert-True (@($e3.notes) -match 'time budget') 'time note'
 }
-Test-That 'meter rollup: grouped by resource, filtered to the meter category, new resources listed' {
+Test-That 'meter rollup: meters first, resources second, filtered to the meter category, new resources listed' {
     Reset-State
     $saved = $global:CostResponder
     $global:CostResponder = {
         param($b, $u)
+        $groupBy = [string]$b.dataset.grouping[0].name
         $rows = @()
         for ($d = $ranges[-1].Start; $d -le $curEnd; $d = $d.AddDays(1)) {
             $cur = $d -ge $curStart
-            $rows += , @([int]$d.ToString('yyyyMMdd'), "/subscriptions/$sub/resourcegroups/rg/providers/microsoft.web/sites/app1", $(if ($cur) { 8 } else { 5 }), 'USD')
-            if ($cur) { $rows += , @([int]$d.ToString('yyyyMMdd'), "/subscriptions/$sub/resourcegroups/rg/providers/microsoft.web/sites/app2", 6, 'USD') }
+            $day = [int]$d.ToString('yyyyMMdd')
+            if ($groupBy -eq 'Meter') {
+                $rows += , @($day, 'P1v3', $(if ($cur) { 8 } else { 5 }), 'USD')
+                if ($cur) { $rows += , @($day, 'P2v3', 6, 'USD') }
+            } else {
+                $rows += , @($day, "/subscriptions/$sub/resourcegroups/rg/providers/microsoft.web/sites/app1", $(if ($cur) { 8 } else { 5 }), 'USD')
+                if ($cur) { $rows += , @($day, "/subscriptions/$sub/resourcegroups/rg/providers/microsoft.web/sites/app2", 6, 'USD') }
+            }
         }
-        New-CostResponse -Columns @('UsageDate', 'ResourceId', 'CostUSD', 'Currency') -Rows $rows
+        New-CostResponse -Columns @('UsageDate', $groupBy, 'CostUSD', 'Currency') -Rows $rows
     }
     try {
         $mf = [PSCustomObject]@{ Id = '0123456789abcdef'; Dimension = 'meter'; Scope = $sub; ResourceId = ''; Meter = 'Azure App Service'; PeriodType = 'week' }
         $e4 = Get-CostChangeEvidence -Finding $mf -MgmtToken 't' -CurrentStart $curStart -CurrentEnd $curEnd -BaselineRanges $ranges -Deadline ([datetime]::UtcNow.AddMinutes(1))
     } finally { $global:CostResponder = $saved }
-    Assert-Equal 1 $global:CostQueryBodies.Count 'one query'
+    Assert-Equal 2 $global:CostQueryBodies.Count 'meter + resource query'
+    Assert-Equal 'Meter' $global:CostQueryBodies[0].dataset.grouping[0].name 'meters first'
     Assert-Equal 'MeterCategory' $global:CostQueryBodies[0].dataset.filter.dimensions.name 'meter filter'
+    Assert-Equal 'MeterCategory' $global:CostQueryBodies[1].dataset.filter.dimensions.name 'meter filter on resources'
+    $d1 = @($e4.facts | Where-Object kind -eq 'driver')[0]
+    Assert-Equal 'meter' $d1.driverKind 'top driver is a meter'
+    Assert-Equal 'P2v3' $d1.name 'new meter leads'
     Assert-True (@($e4.facts | Where-Object kind -eq 'new-resource').resourceId -like '*app2') 'new resource'
+    $sp = @($e4.facts | Where-Object kind -eq 'spread')[0]
+    Assert-Equal 2 $sp.resourceCount 'spread over two resources'
     Set-EvidenceResourceNames -Evidence $e4 -NameMap @{ "/subscriptions/$sub/resourcegroups/rg/providers/microsoft.web/sites/app2" = 'Checkout API' }
     Assert-Equal 'Checkout API' @($e4.facts | Where-Object kind -eq 'new-resource')[0].name 'display name stamped'
+}
+Test-That 'meter rollup: a rise spread thinly lists no noise resources, only the spread' {
+    $res = @{}
+    for ($i = 0; $i -lt 50; $i++) { $res["/subscriptions/$sub/rg/vm$i"] = [PSCustomObject]@{ Key = "/subscriptions/$sub/rg/vm$i"; Current = 12.0; Baseline = 10.0 } }
+    $res['/subscriptions/x/rg/plan'] = [PSCustomObject]@{ Key = '/subscriptions/x/rg/plan'; Current = 3.0; Baseline = 1.5 }
+    $rd = Get-ChangeDrivers -Cost $res -TopIncreases 8 -TopDecreases 0
+    $facts = @(New-EvidenceFacts -DriverKind 'meter' -Drivers $null -ResourceDrivers $rd -ResourceMinSharePct 10)
+    Assert-Equal 0 @($facts | Where-Object kind -eq 'driver').Count 'no resource under 10% listed'
+    $sp = @($facts | Where-Object kind -eq 'spread')[0]
+    Assert-Equal 51 $sp.resourceCount 'all rising resources counted'
+    Assert-True ($sp.topSharePct -lt 3) 'largest share is small'
 }
 
 Write-Host "`nExplanation + AI budget"
@@ -610,9 +635,13 @@ Test-That 'EvidenceMaxFindings = 0 skips evidence and explanation' {
     Assert-Equal 0 $global:CostQueryBodies.Count 'no evidence queries'
 }
 
-Test-That 'the month rollup waits for a night when today''s ingest has reported' {
+Test-That 'the month rollup waits while the ingest may still rewrite the month''s last days' {
     Initialize-SnapshotStore
     $env:AI_API_KEY = ''
+    # The unreported-ingest safety window is BaselineDays + 2 days back from today. With the
+    # default 7, last month leaves that window on the 10th, so the result depended on the date
+    # the tests ran. 40 keeps last month inside it on any day.
+    Set-Setting @{ BaselineDays = 40 }
     $first = [datetime]::new([datetime]::UtcNow.Year, [datetime]::UtcNow.Month, 1).AddMonths(-1)
     for ($d = $first; $d -lt $first.AddMonths(1); $d = $d.AddDays(1)) {
         Set-TableEntity -Table 'CostSnapshots' -Entity @{ PartitionKey = $d.ToString('yyyy-MM-dd'); RowKey = 'm1'
@@ -629,6 +658,83 @@ Test-That 'the month rollup waits for a night when today''s ingest has reported'
     } finally { $global:IngestState = [PSCustomObject]@{ Complete = $true; Reported = $true; Reason = 'stub' } }
     & $timer -Timer $null *> $null
     Assert-Equal 1 (& $monthRollups) 'rolled up once the ingest reported'
+}
+
+# Ten VMs, each mostly compute, each with a small Defender plan that rises in the current window.
+# No VM moves enough to be a finding, and Defender is never any VM's largest category, so only
+# the exact category totals can see the rise.
+function Initialize-SpreadStore {
+    param([switch]$WithCategories, [int]$CategoryDays = 999)
+    Reset-State
+    $env:AI_API_KEY = ''
+    Set-Setting @{ EvidenceMaxFindings = 0 }
+    $windowEnd = [datetime]::UtcNow.Date.AddDays(-2)
+    $i = 0
+    for ($d = $windowEnd.AddDays(-40); $d -le $windowEnd; $d = $d.AddDays(1)) {
+        $inCurrent = $d -gt $windowEnd.AddDays(-7)
+        $def = if ($inCurrent) { 4.0 } else { 0.5 }
+        $day = $d.ToString('yyyy-MM-dd')
+        foreach ($n in 1..10) {
+            $id = "/subscriptions/$sub/resourcegroups/rg/providers/microsoft.compute/virtualmachines/vm$n"
+            Set-TableEntity -Table 'CostSnapshots' -Entity @{ PartitionKey = $day; RowKey = (Get-ShortHash -Value $id)
+                Date = $day; DimensionKey = $id; Scope = $sub; ResourceId = $id; Meter = 'Virtual Machines'; CostUsd = 100.0 + $def }
+        }
+        if ($WithCategories -and $i -lt $CategoryDays) {
+            foreach ($c in @(@{ m = 'Virtual Machines'; v = 1000.0 }, @{ m = 'Microsoft Defender for Cloud'; v = 10 * $def })) {
+                Set-TableEntity -Table 'CostSnapshots' -Entity @{ PartitionKey = "cat|$day"; RowKey = (Get-ShortHash -Value "$sub|$($c.m)"); Kind = 'category'
+                    Date = $day; DimensionKey = (Get-DimensionKey -Dimension 'meter' -Scope $sub -Meter $c.m); Scope = $sub; ResourceId = ''; Meter = $c.m; CostUsd = $c.v }
+            }
+        }
+        $i++
+    }
+}
+Test-That 'meter grain: a rise spread thinly over many resources is found from the category totals' {
+    Initialize-SpreadStore -WithCategories
+    & $timer -Timer $null *> $null
+    $rows = @($global:Store['CostSpikes'].Values | Where-Object { $_.PartitionKey -like 'week|*' })
+    Assert-Equal 1 $rows.Count 'one weekly finding'
+    Assert-Equal 'meter' $rows[0].Dimension 'a meter finding'
+    Assert-Equal 'Microsoft Defender for Cloud' $rows[0].Meter 'Defender'
+    Assert-Equal 245.0 ([Math]::Round([double]$rows[0].DeltaUsd, 2)) 'the whole category rise: 10 VMs x 3.5 x 7'
+    Assert-Equal 'open' $rows[0].State 'current level measured from the category totals'
+}
+Test-That 'monthly: category totals are rolled up beside the resource rows and drive the meter grain' {
+    Reset-State
+    $env:AI_API_KEY = ''
+    Set-Setting @{ EvidenceMaxFindings = 0 }
+    $m1 = [datetime]::new([datetime]::UtcNow.Year, [datetime]::UtcNow.Month, 1).AddMonths(-1)   # analysed
+    for ($d = $m1.AddMonths(-2); $d -lt $m1.AddMonths(1); $d = $d.AddDays(1)) {
+        $def = if ($d -ge $m1) { 4.0 } else { 0.5 }
+        $day = $d.ToString('yyyy-MM-dd')
+        foreach ($n in 1..10) {
+            $id = "/subscriptions/$sub/resourcegroups/rg/providers/microsoft.compute/virtualmachines/vm$n"
+            Set-TableEntity -Table 'CostSnapshots' -Entity @{ PartitionKey = $day; RowKey = (Get-ShortHash -Value $id)
+                Date = $day; DimensionKey = $id; Scope = $sub; ResourceId = $id; Meter = 'Virtual Machines'; CostUsd = 100.0 + $def }
+        }
+        foreach ($c in @(@{ m = 'Virtual Machines'; v = 1000.0 }, @{ m = 'Microsoft Defender for Cloud'; v = 10 * $def })) {
+            Set-TableEntity -Table 'CostSnapshots' -Entity @{ PartitionKey = "cat|$day"; RowKey = (Get-ShortHash -Value "$sub|$($c.m)"); Kind = 'category'
+                Date = $day; DimensionKey = (Get-DimensionKey -Dimension 'meter' -Scope $sub -Meter $c.m); Scope = $sub; ResourceId = ''; Meter = $c.m; CostUsd = $c.v }
+        }
+    }
+    & $timer -Timer $null *> $null
+    $key = $m1.ToString('yyyy-MM')
+    Assert-True ([bool]$global:Store['PortalConfig']["rollup|month|$key"].Categories) 'marker records the category rows'
+    $cat = @($global:Store['CostPeriods'].Values | Where-Object { $_.PartitionKey -eq "month|$key" -and $_.Kind -eq 'category' })
+    Assert-Equal 2 $cat.Count 'one row per category'
+    Assert-Equal 10 @($global:Store['CostPeriods'].Values | Where-Object { $_.PartitionKey -eq "month|$key" -and $_.Kind -ne 'category' }).Count 'resource rows untouched'
+    $f = @($global:Store['CostSpikes'].Values | Where-Object { $_.PartitionKey -eq "month|$key" })
+    Assert-Equal 1 $f.Count 'one monthly finding'
+    Assert-Equal 'Microsoft Defender for Cloud' $f[0].Meter 'the Defender category'
+    $days = [datetime]::DaysInMonth($m1.Year, $m1.Month)
+    Assert-Equal (10 * 4.0 * $days) ([Math]::Round([double]$f[0].SpikeUsd, 2)) 'its exact month total'
+}
+Test-That 'meter grain: without category totals for every day it keeps the label basis (and misses it)' {
+    Initialize-SpreadStore
+    & $timer -Timer $null *> $null
+    Assert-Equal 0 @($global:Store['CostSpikes'].Values | Where-Object { $_.PartitionKey -like 'week|*' }).Count 'nothing on the label basis'
+    Initialize-SpreadStore -WithCategories -CategoryDays 20
+    & $timer -Timer $null *> $null
+    Assert-Equal 0 @($global:Store['CostSpikes'].Values | Where-Object { $_.PartitionKey -like 'week|*' }).Count 'partly covered: never mixes the two bases'
 }
 
 Write-Host "`nMonth overview (forecast, budgets, by service)"

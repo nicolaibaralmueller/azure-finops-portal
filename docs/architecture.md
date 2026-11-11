@@ -33,7 +33,7 @@ Tables:
 
 | Table | Holds |
 |---|---|
-| `CostSnapshots` | Daily cost per resource (raw, pruned after `SnapshotRetentionDays`) |
+| `CostSnapshots` | Daily cost per resource (raw, pruned after `SnapshotRetentionDays`); partition `cat\|yyyy-MM-dd` holds the day's exact total per subscription and meter category |
 | `CostPeriods` | Month rollups per resource, for the monthly baseline |
 | `CostSpikes` | Cost-change findings + evidence, partitioned `<week\|month>\|<period>` |
 | `CostSummary` | `dailytotal` (billed daily totals), `monthly-sub` (monthly total per subscription), `monthoverview` (forecast, budgets), `allocation` (spend per owner / tag / resource group), `resourcecost` (every resource's cost this month and last month), `statement`, `statement-daily` (each month's spend per tag value by day, for the statement trend), `statementbudgets`, `brief` (weekly / monthly payload + findings) |
@@ -92,10 +92,33 @@ change.
   calendar and complete-only.
 - **Baseline:** the *median* of the prior complete periods — 4 weeks, 3 months — so one unusual
   period can neither mask a change nor manufacture one. Baseline windows never overlap the
-  current one.
+  current one. A baseline period in which a key was **created** (it started after the first day
+  and had cost every day after; `Get-StartedSpanDays`, stored per dimension on the rollup and
+  window rows) counts at its daily level scaled to a whole period, so a VM created on the 12th
+  is not a "cheap month". A start in the period's last 2 days is left out of the baseline. Gaps
+  mean an intermittent workload, which is never scaled.
 - **Thresholds** (`PortalConfig`): weekly `$150 / 25%`, monthly `$500 / 15%`.
 - **Sustained increases** (`Find-CostStepUp`, `DetectSavings-Timer`) are reported with the cost
   changes, never as savings.
+
+**Finding lifecycle** (explained on the page under "How these findings are calculated"):
+
+- **State** (`Get-FindingState`) is judged nightly from the *current level*: the mean of the latest
+  3 settled days (to D-2), scaled to a whole period — for a closed month, these are days after it.
+  `resolved` = that level would no longer clear the bar; `decreasing` = still above it but at most
+  75% of the period's average day; `open` otherwise. A month that already ended below the bar
+  (`Measure-ExitRunRate`) stays resolved. So a cost that drops is shown as resolved within ~3 days,
+  instead of waiting for the high days to leave the 7-day window.
+- **New normal:** a lasting increase stops being listed once it dominates the median — about 3
+  weeks on the weekly grain, 2 months on the monthly one (listed for the month it started and the
+  next).
+- **Removal:** nothing is removed by hand. The page shows the newest period; a finding disappears
+  when a later period no longer clears the bar. The newest period of each grain is re-analysed
+  every night, and that run is the whole answer for it: a stored row it no longer flags (a
+  baseline that caught up, a rollup now covered by a resource finding, a changed rule) is deleted
+  rather than left with old figures. Rows are kept 800 days and reachable via "Earlier".
+- The `analyzed` marker stores the baseline windows/months (`BaselineRangesJson`) and the
+  `SettledThrough` day, so the page can name the exact dates compared.
 
 **Rollups make the monthly grain affordable.** `DetectCostSpikes-Timer` rolls each newly complete
 month into `CostPeriods`, reading one day at a time so memory stays bounded, only when every day
@@ -103,6 +126,19 @@ has snapshots. The trailing 7-day windows are computed from `CostSnapshots` dire
 every day in that span must have data. The aggregation streams rows into accumulators
 (`Measure-DailyDimensionCost`, `Get-ResourceCostMap`): the B2 plan's memory is shared with the
 portal.
+
+**The meter grain uses exact category totals.** A per-resource snapshot row carries one label, the
+resource's largest meter category that day, so a category built from those labels misses every
+charge that is never a resource's largest: a VM's Defender plan counts as "Virtual Machines", and
+a Defender plan switched on across many VMs was invisible to the Defender rollup. The ingest
+therefore also writes, from the same query and at no extra cost, one total per (day, subscription,
+meter category) into `CostSnapshots` partition `cat|yyyy-MM-dd` (resource-attributed cost, the
+same basis as the other grains). Every other reader asks for the plain day partition, so these
+rows are never summed in. Detection rolls them into the month's `CostPeriods` partition
+(`RowKey cat|…`, `Kind = category`; the rollup marker's `Categories` flag) and the trailing weeks
+read them per day. The meter grain uses them only when the analysed period and every baseline
+period have them; otherwise it keeps the label basis rather than compare two methods. History
+stored before this existed is fetched once more (`backfill/history.CategoryTotals`).
 
 ## The cost-change pipeline
 
@@ -124,7 +160,14 @@ portal.
                   changes        Activity Log (90 days) + Resource Graph change history (old -> new)
                   new resources  cost now, none in the baseline
                   owner          owner / cost-centre tags
-                Every fact is numbered (F1, F2, …) and stored on the finding.
+                  daily shape    how the cost moved within the period, and where it stands now
+                                 (state, current daily level, as-of day)
+                A meter-category finding exists because no single resource explains it, so it
+                breaks down by meter inside the category first; a resource is listed only when it
+                carries at least 10% of the rise, and a 'spread' fact says how many resources rose
+                and the largest one's share.
+                Every fact is numbered (F1, F2, …) and stored on the finding with the evidence
+                version (Get-CostEvidenceVersion); older evidence is gathered again on demand.
   5. EXPLAIN    Invoke-CostChangeExplanation: the model reasons only over those facts, cites them,
                 and says explained=false when nothing recorded accounts for the change
   6. PERSIST    citation and grounding checks -> CostSpikes
@@ -150,7 +193,8 @@ The per-subscription monthly rows are derived from the daily ones instead of a 1
 subscription (about 1,100 QPU a night).
 
 **Timers** run on fixed offsets in UTC: 02:00 ingest (queued; done in minutes) → 02:35 savings → 02:40 detect → 02:45 Advisor
-→ 02:50 commitments → 02:55 monthly totals, forecast and budgets, cost scope → 03:05 allocation,
+→ 02:50 commitments → 02:55 monthly totals, forecast and budgets, cost scope
+(`SyncMonthlyCosts-Timer`) → 03:05 allocation,
 statements, per-resource cost → 03:15 brief and findings. Detection works on settled periods and
 does not wait for the ingest; it starts at 02:40, after the ingest has normally finished, and a
 month is only rolled up (cached for good) once the ingest has reported or the month lies outside

@@ -82,6 +82,7 @@ function global:Get-TableEntities {
     $rows = @($t.Values)
     if ($Filter -match "PartitionKey eq '((?:[^']|'')*)'") { $pk = $Matches[1].Replace("''", "'"); $rows = @($rows | Where-Object { $_.PartitionKey -eq $pk }) }
     if ($Filter -match "PartitionKey lt '([^']*)'") { $v = $Matches[1]; $rows = @($rows | Where-Object { [string]::CompareOrdinal([string]$_.PartitionKey, $v) -lt 0 }) }
+    if ($Filter -match "PartitionKey ge '([^']*)'") { $v = $Matches[1]; $rows = @($rows | Where-Object { [string]::CompareOrdinal([string]$_.PartitionKey, $v) -ge 0 }) }
     if ($Filter -match "RowKey eq '((?:[^']|'')*)'") { $rk = $Matches[1].Replace("''", "'"); $rows = @($rows | Where-Object { $_.RowKey -eq $rk }) }
     if ($Filter -match "RowKey ge '([^']*)'") { $ge = $Matches[1]; $rows = @($rows | Where-Object { [string]$_.RowKey -ge $ge }) }
     # Range ends compare ordinally, as Table storage does.

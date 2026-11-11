@@ -42,10 +42,13 @@ function Join-Commitment {
         $listed += $r
     }
     $id = if ($Inv) { [string]$Inv.id } else { ([string]$Usage.BenefitId).ToLowerInvariant() }
-    $name = if ($Inv -and $Inv.name) { [string]$Inv.name } elseif ($Usage -and $Usage.Name) { [string]$Usage.Name } else { ($id -split '/')[-1] }
+    $kind = if ($Inv) { [string]$Inv.kind } elseif ($Usage) { [string]$Usage.Kind } else { 'commitment' }
+    # The inventory's displayName, else the billing data's name, else "Reservation 1a2b3c4d" —
+    # never a bare GUID (older inventory rows stored 'orderId/reservationId' as the name).
+    $name = Get-CommitmentDisplayName -Candidates @([string]$Inv.name, [string]$Usage.Name) -Id $id -Kind $kind
     [PSCustomObject]@{
         id = $id; name = $name
-        kind = if ($Inv) { [string]$Inv.kind } elseif ($Usage) { [string]$Usage.Kind } else { 'commitment' }
+        kind = $kind
         inInventory = ($null -ne $Inv)
         # active | cancelled | expired; 'unknown' = seen only in cost data (no Reservations Reader
         # role, or it is no longer listed).
@@ -57,6 +60,11 @@ function Join-Commitment {
         hasUsageData = ($null -ne $Usage)
         used30dUsd = if ($Usage) { [double]$Usage.Used30dUsd } else { $null }
         used7dUsd = if ($Usage) { [double]$Usage.Used7dUsd } else { $null }
+        # Usage hours (or units) — what "used" is judged on, since some tenants get 0 for the
+        # covered cost (costHidden). Null on rows synced before these were stored.
+        quantity30d = if ($Usage -and $null -ne $Usage.Quantity30d) { [double]$Usage.Quantity30d } else { $null }
+        quantity7d = if ($Usage -and $null -ne $Usage.Quantity7d) { [double]$Usage.Quantity7d } else { $null }
+        costHidden = [bool]($Usage -and [bool]$Usage.CostHidden)
         unused30dUsd = if ($Usage -and [bool]$Usage.UnusedKnown) { [double]$Usage.Unused30dUsd } else { $null }
         unused7dUsd = if ($Usage -and [bool]$Usage.UnusedKnown) { [double]$Usage.Unused7dUsd } else { $null }
         lastUsed = if ($Usage) { [string]$Usage.LastUsed } else { $null }

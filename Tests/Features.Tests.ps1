@@ -794,6 +794,12 @@ $commitmentResponder = {
             , @(20.0, 24.0, (& $d 20), $r1, $vmB1, 'USD')
             , @(10.0, 12.0, (& $d 25), $r2, $vmA2, 'USD'))
     }
+    # The name query (one row per commitment, no daily buckets).
+    if ($b.dataset.granularity -eq 'None') {
+        return New-CostResponse -Columns @('CostUSD', 'BenefitId', 'BenefitName', 'Currency') -Rows @(
+            , @(80.0, $r1, 'E4s pool', 'USD')
+            , @(10.0, $r2, 'D2s west', 'USD'))
+    }
     return New-CostResponse -Columns @('CostUSD', 'UsageDate', 'BenefitId', 'BenefitName', 'Currency') -Rows @(
         , @(15.0, (& $d 3), $r2, 'D2s west', 'USD')
         , @(5.0, (& $d 20), $r2, 'D2s west', 'USD'))
@@ -820,6 +826,36 @@ Test-That 'commitment consumption: per-resource shares, 7- and 30-day totals, un
     Assert-Equal 15.0 $b.unused7dUsd 'unused over 7 days'
     Assert-Equal 'D2s west' $b.name 'name from cost data'
     Assert-Equal 0.0 $b.used7dUsd 'nothing used r2 this week'
+    Assert-Equal 'E4s pool' $a.name 'a fully used reservation (no unused hours) is named too'
+}
+Test-That 'commitment consumption: a tenant that reports 0 for covered cost is judged on usage hours' {
+    Reset-State
+    $global:CostResponder = {
+        param($b, $u)
+        $d = { param([int]$Ago) [int][datetime]::UtcNow.Date.AddDays(-$Ago).ToString('yyyyMMdd') }
+        if ($b.dataset.filter.and) {
+            return New-CostResponse -Columns @('CostUSD', 'UsageQuantity', 'UsageDate', 'BenefitId', 'ResourceId', 'Currency') -Rows @(
+                , @(0.0, 24.0, (& $d 2), $r1, $vmA1, 'DKK')
+                , @(0.0, 72.0, (& $d 20), $r1, $vmA2, 'DKK'))
+        }
+        return New-CostResponse -Columns @('CostUSD', 'BenefitId', 'BenefitName', 'Currency') -Rows @()
+    }
+    $c = Get-CommitmentConsumption -MgmtToken 't' -Scopes @("/subscriptions/$subA")
+    $a = @($c.Items | Where-Object id -eq $r1.ToLowerInvariant())[0]
+    Assert-True $a.costHidden 'cost hidden'
+    Assert-Equal 24.0 $a.quantity7d 'used this week, by hours'
+    Assert-Equal 96.0 $a.quantity30d 'hours over 30 days'
+    Assert-Equal $vmA2.ToLowerInvariant() $a.resources[0].resourceId 'largest by hours first'
+    Assert-Equal 75.0 $a.resources[0].sharePct 'share by hours (72 of 96)'
+}
+Test-That 'commitment display name: never a bare GUID' {
+    $g1 = '0a1b2c3d-1111-2222-3333-444455556666'; $g2 = '9f8e7d6c-1111-2222-3333-444455556666'
+    $id = "/providers/microsoft.capacity/reservationorders/$g1/reservations/$g2"
+    Assert-Equal 'VM E4s v6' (Get-CommitmentDisplayName -Candidates @('VM E4s v6', 'other') -Id $id) 'first real name'
+    Assert-Equal 'E4s pool' (Get-CommitmentDisplayName -Candidates @("$g1/$g2", 'E4s pool') -Id $id) 'an ARM order/reservation name is skipped'
+    Assert-Equal 'E4s pool' (Get-CommitmentDisplayName -Candidates @('', $g2, 'E4s pool') -Id $id) 'empty and GUID skipped'
+    Assert-Equal 'Reservation 9f8e7d6c' (Get-CommitmentDisplayName -Candidates @('', $null) -Id $id) 'kind + short id as the last resort'
+    Assert-Equal 'Savings plan 9f8e7d6c' (Get-CommitmentDisplayName -Candidates @() -Id $id -Kind 'savings plan') 'savings plan'
 }
 Test-That 'Reservations page: inventory joined with usage; out-of-scope resources summed, not listed' {
     Reset-State

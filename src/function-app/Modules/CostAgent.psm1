@@ -328,9 +328,17 @@ about WHAT, for HOW MUCH.
 
 The user message is JSON, already calculated (amounts in USD unless a row says otherwise):
 - grain: week (this month so far) or month (the last complete month); today
-- spend: this period against the one before; forecastUsd is Azure's month-end forecast
+- spend: this period against the one before; forecastUsd is Azure's month-end forecast. Each
+  figure carries the exact days it sums (from, to). A month-to-date figure is compared with the
+  SAME days of the previous month (previousSamePeriod), not the whole month.
 - changes: the largest cost increases (ids C-…) of the last 7 days and of last month — each
-  item's period says which
+  item's period says which. state says where it stands NOW, from the latest settled days
+  (currentRunRateUsd, on the same footing as currentUsd, as of currentAsOf): open = still running
+  high; decreasing = falling but still above normal; resolved = already back to normal.
+  A decreasing change is never priority 1: rank it on currentExcessUsd (what is still being
+  overspent per period now), not on deltaUsd, and say that it is falling — with fallPct and
+  fallSince when given (e.g. "down 42% since 3 Nov"). Do not report a
+  resolved change as a finding.
 - savings: open savings opportunities with their estimated monthly saving (ids S-…, A-…).
   billingScope true = a reservation / savings-plan purchase for the billing account: it has no
   resource and so no owner. Present it as a purchase decision, never as missing an owner.
@@ -346,7 +354,9 @@ the billing currency), change_evidence (C-…) and saving_detail (S-…/A-…). 
 ref (Q1, Q2, …). Use at most 5 tool calls; skip them when the payload already answers.
 
 Then answer with ONE JSON object:
-- summary: 2-3 sentences on the period as a whole.
+- summary: 2-3 sentences on the period as a whole. When you compare spend, name both date
+  ranges from their from/to (e.g. "1-8 November against 1-8 October"; a forecast against "all of
+  October"), never just "the same period".
 - findings: 3 to 6, most important first. Important = a large amount that someone can act on:
   waste, non-production running like production, sudden or growing increases, spend nobody owns,
   savings not acted on. Every finding is about something SPECIFIC the reader can open and act
@@ -422,7 +432,7 @@ function Remove-InsightJargon {
     # Internal placeholder values quoted as text: "(untagged)", "(resource no longer exists)".
     $t = [regex]::Replace($t, '(?i)\s*owner shown as\s*', ' ')
     $t = [regex]::Replace($t, '\((untagged|resource no longer exists|tags unavailable)\)', { param($m) switch ($m.Groups[1].Value) { 'untagged' { 'untagged' } 'resource no longer exists' { 'deleted' } default { 'unknown' } } })
-    $t = [regex]::Replace($t, '\b(?:with\s+)?(?:monthlyUsd|deltaUsd|currentUsd|baselineUsd|deltaPct|sharePct|estMonthlySavings|monthlyCost)\b\s*[:=]?\s*\$?[\d.,]*', '')
+    $t = [regex]::Replace($t, '\b(?:with\s+)?(?:monthlyUsd|deltaUsd|currentUsd|currentRunRateUsd|currentExcessUsd|baselineUsd|deltaPct|sharePct|estMonthlySavings|monthlyCost)\b\s*[:=]?\s*\$?[\d.,]*', '')
     $t = [regex]::Replace($t, '\s*\(?\b(?:item\s+|id\s+)?(?:[CSA]-[0-9a-fA-F]{8,}|RG-\d+|O-\d+|Q\d+)\b\)?', '')
     $t = [regex]::Replace($t, '\(\s+', '(')
     $t = [regex]::Replace($t, '\s{2,}', ' ')
@@ -443,7 +453,13 @@ function Select-InsightFindings {
         [Parameter(Mandatory)][hashtable]$Map,
         [string[]]$Currencies = @(),
         [hashtable]$UntaggedRefs = @{},
-        [hashtable]$BillingScopeRefs = @{}
+        [hashtable]$BillingScopeRefs = @{},
+        # C-… id -> 'open' | 'decreasing' | 'resolved'
+        [hashtable]$ChangeStates = @{},
+        # C-… id -> current overspend per period (USD), for ranking a falling change
+        [hashtable]$ChangeExcess = @{},
+        # last month's spend, the scale priorities are judged against (Get-AmountPriority)
+        [double]$BaseUsd = 0
     )
     $okCurrencies = @('USD') + @($Currencies)
     $kept = @(); $dropped = 0; $n = 0
@@ -453,6 +469,20 @@ function Select-InsightFindings {
         if ($prio -lt 1 -or $prio -gt 3) { $prio = 3 }
         $refs = @(@($f.refs) | ForEach-Object { [string]$_ } | Where-Object { $KnownRefs.ContainsKey($_) } | Select-Object -Unique)
         if (-not $refs.Count) { $dropped++; continue }
+        # Belt and braces for the prompt's rule on a cost change's state. A finding that rests only
+        # on changes that are no longer running high: all resolved → dropped; otherwise ranked on
+        # what is still being overspent now (never more urgent than that, and never priority 1).
+        # Savings, owners and queries in the refs lift this.
+        $changeRefs = @($refs | Where-Object { $_ -like 'C-*' })
+        if ($changeRefs.Count -and $changeRefs.Count -eq $refs.Count) {
+            $states = @($changeRefs | ForEach-Object { if ($ChangeStates.ContainsKey($_)) { [string]$ChangeStates[$_] } else { 'open' } })
+            if (@($states | Where-Object { $_ -ne 'resolved' }).Count -eq 0) { $dropped++; continue }
+            if (@($states | Where-Object { $_ -eq 'open' }).Count -eq 0) {
+                $excess = @($changeRefs | Where-Object { $ChangeExcess.ContainsKey($_) -and $null -ne $ChangeExcess[$_] } | ForEach-Object { [double]$ChangeExcess[$_] })
+                $floor = if ($excess.Count) { [Math]::Max(2, (Get-AmountPriority -Usd (($excess | Measure-Object -Sum).Sum) -BaseUsd $BaseUsd)) } else { 2 }
+                if ($prio -lt $floor) { $prio = $floor }
+            }
+        }
         $cost = if ($null -ne $f.monthlyCost -and "$($f.monthlyCost)" -ne '') { [double]$f.monthlyCost } else { $null }
         $save = if ($null -ne $f.estMonthlySavings -and "$($f.estMonthlySavings)" -ne '') { [double]$f.estMonthlySavings } else { $null }
         # A saving must rest on a saving, a cost change or a query result — not on an owner or
@@ -502,11 +532,27 @@ function Select-InsightFindings {
 # Get-RuleFindings — the no-AI findings: the same payload ranked by amount. Pure.
 # Priority is the amount against last month's spend: >= 2% → 1, >= 0.5% → 2, else 3.
 # ----------------------------------------------------------------------------
-function Get-RuleFindings {
-    param([Parameter(Mandatory)]$Payload, [int]$Max = 6)
+# The priority an amount earns against last month's spend: >= 2% → 1, >= 0.5% → 2, else 3
+# (2 when there is no spend to compare with). Pure.
+function Get-AmountPriority {
+    param([double]$Usd, [double]$BaseUsd)
+    if ($BaseUsd -le 0) { return 2 }
+    $p = $Usd / $BaseUsd
+    if ($p -ge 0.02) { return 1 } elseif ($p -ge 0.005) { return 2 } else { return 3 }
+}
+
+# The spend priorities are judged against: last month's, else this month's so far.
+function Get-PriorityBaseUsd {
+    param($Payload)
     $base = [double]($Payload.spend.previousMonth.usd ?? 0)
     if ($base -le 0) { $base = [double]($Payload.spend.current.usd ?? 0) }
-    $prio = { param([double]$Usd) if ($base -le 0) { return 2 } $p = $Usd / $base; if ($p -ge 0.02) { 1 } elseif ($p -ge 0.005) { 2 } else { 3 } }
+    return $base
+}
+
+function Get-RuleFindings {
+    param([Parameter(Mandatory)]$Payload, [int]$Max = 6)
+    $base = Get-PriorityBaseUsd $Payload
+    $prio = { param([double]$Usd) Get-AmountPriority -Usd $Usd -BaseUsd $base }
     $items = @()
     foreach ($s in @($Payload.savings.items)) {
         $items += [PSCustomObject]@{
@@ -515,12 +561,18 @@ function Get-RuleFindings {
             action = [string]$s.title; actionScript = ''; refs = @([string]$s.id); sortUsd = [double]$s.monthlyUsd
         }
     }
-    foreach ($c in @($Payload.changes.items | Select-Object -First 3)) {
+    # Changes already back to normal are not findings. Falling ones are ranked on what is still
+    # being overspent now, and are never priority 1.
+    foreach ($c in @($Payload.changes.items | Where-Object { [string]$_.state -ne 'resolved' -and -not ([bool]$_.resolved) } | Select-Object -First 3)) {
+        $amount = [double]$c.deltaUsd
+        if ([string]$c.state -eq 'decreasing' -and $null -ne $c.currentExcessUsd) { $amount = [double]$c.currentExcessUsd }
+        $p = & $prio $amount
+        if ([string]$c.state -eq 'decreasing' -and $p -lt 2) { $p = 2 }
         $items += [PSCustomObject]@{
-            priority = (& $prio ([double]$c.deltaUsd)); title = (Get-PortalText 'rule.costUp' @{ name = [string]$c.name })
+            priority = $p; title = (Get-PortalText 'rule.costUp' @{ name = [string]$c.name })
             why = if ($c.cause) { [string]$c.cause } else { Get-PortalText 'rule.notExplained' }
             owner = [string]$c.owner; billingScope = $false; monthlyCost = [double]$c.currentUsd; estMonthlySavings = $null; currency = 'USD'
-            action = (Get-PortalText 'rule.askOwner'); actionScript = ''; refs = @([string]$c.id); sortUsd = [double]$c.deltaUsd
+            action = (Get-PortalText 'rule.askOwner'); actionScript = ''; refs = @([string]$c.id); sortUsd = $amount
         }
     }
     $i = 0
@@ -575,7 +627,14 @@ function Invoke-CostInsights {
     foreach ($o in @($Payload.owners)) { if ([string]$o.owner -like '(*') { $untagged[[string]$o.id] = $true } }
     $billing = @{}
     foreach ($s in @($Payload.savings.items)) { if ([bool]$s.billingScope) { $billing[[string]$s.id] = $true } }
-    $sel = Select-InsightFindings -Parsed $r.Parsed -AllowedText $allowed -KnownRefs $known -Map $map -Currencies @($ctx.Currencies) -UntaggedRefs $untagged -BillingScopeRefs $billing
+    $changeStates = @{}
+    $changeExcess = @{}
+    foreach ($c in @($Payload.changes.items)) {
+        if ($c.state) { $changeStates[[string]$c.id] = [string]$c.state }
+        if ($null -ne $c.currentExcessUsd) { $changeExcess[[string]$c.id] = [double]$c.currentExcessUsd }
+    }
+    $sel = Select-InsightFindings -Parsed $r.Parsed -AllowedText $allowed -KnownRefs $known -Map $map -Currencies @($ctx.Currencies) -UntaggedRefs $untagged -BillingScopeRefs $billing `
+        -ChangeStates $changeStates -ChangeExcess $changeExcess -BaseUsd (Get-PriorityBaseUsd $Payload)
     $toolCalls = @($ctx.Log | ForEach-Object {
         $a = ($_.args | ConvertTo-Json -Depth 8 -Compress)
         [PSCustomObject]@{ ref = $_.ref; tool = $_.tool; args = $(if ($a.Length -gt 400) { $a.Substring(0, 400) } else { $a }); summary = $_.summary }
@@ -589,4 +648,4 @@ function Invoke-CostInsights {
 Export-ModuleMember -Function Get-EnvironmentGuess, Get-AllocationRows, Get-InsightOwners, Get-InsightResourceGroups, `
     New-PseudonymMap, Add-Pseudonym, Protect-AgentText, Unprotect-AgentText, Convert-AgentObject, Register-PayloadNames, `
     Get-InsightTools, Invoke-InsightTool, Resolve-InsightCostScope, Get-InsightSystemPrompt, Get-InsightSchema, `
-    Select-InsightFindings, Remove-InsightJargon, Get-RuleFindings, Invoke-CostInsights
+    Select-InsightFindings, Remove-InsightJargon, Get-RuleFindings, Get-AmountPriority, Get-PriorityBaseUsd, Invoke-CostInsights

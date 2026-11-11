@@ -68,6 +68,9 @@ function Measure-MonthSpend {
     }
     return [PSCustomObject]@{
         month        = $Month.ToString('yyyy-MM')
+        # The exact days summed, so a comparison can name them ("1-8 Nov vs 1-8 Oct").
+        from         = ([datetime]::new($Month.Year, $Month.Month, 1)).ToString('yyyy-MM-dd')
+        to           = ([datetime]::new($Month.Year, $Month.Month, $last)).ToString('yyyy-MM-dd')
         throughDay   = $last
         daysInMonth  = $dim
         usd          = [Math]::Round($usd, 2)
@@ -171,8 +174,16 @@ function Get-BriefChanges {
     $rows = @(Get-TableEntities -Table 'CostSpikes' -Filter "PartitionKey eq '$(ConvertTo-ODataLiteral -Value $pk)'" -Token $Token)
     # Findings stored before the operator narrowed the subscription scope are dropped here.
     $rows = @(Select-InSubscriptionScope -Scope (Get-SubscriptionScope -Token $Token) -Rows $rows)
-    # Changes that already fell back during the period (Resolved) are not news: open ones first.
-    $items = @($rows | Sort-Object @{ Expression = { [bool]$_.Resolved } }, @{ Expression = { [double]$_.DeltaUsd }; Descending = $true } | Select-Object -First $Top | ForEach-Object {
+    # Where each change stands now (DetectCostSpikes-Timer, Get-FindingState). Rows from before the
+    # state existed derive it from the month-end flag. Open ones first: a change that is falling
+    # or already back below the bar is not news, and must not be ranked as urgent.
+    $stateOf = { param($r) if ($r.State) { [string]$r.State } elseif ([bool]$r.Resolved) { 'resolved' } else { 'open' } }
+    $rank = @{ open = 0; decreasing = 1; resolved = 2 }
+    $items = @($rows | Sort-Object @{ Expression = { $rank[(& $stateOf $_)] } }, @{ Expression = { [double]$_.DeltaUsd }; Descending = $true } | Select-Object -First $Top | ForEach-Object {
+        $state = & $stateOf $_
+        $days = 0
+        try { $days = ([datetime]::ParseExact([string]$_.PeriodEnd, 'yyyy-MM-dd', $null) - [datetime]::ParseExact([string]$_.PeriodStart, 'yyyy-MM-dd', $null)).Days + 1 } catch { $days = 0 }
+        $currentDaily = if ($null -ne $_.CurrentDailyUsd -and [double]$_.CurrentDailyUsd -ge 0) { [double]$_.CurrentDailyUsd } else { $null }
         $dimension = if ($_.Dimension) { [string]$_.Dimension } else { 'resource' }
         $name = switch ($dimension) {
             'meter'        { "$([string]$_.Meter) in $(if ($_.ScopeName) { [string]$_.ScopeName } else { [string]$_.Scope })" }
@@ -197,7 +208,19 @@ function Get-BriefChanges {
             deltaUsd    = [Math]::Round([double]$_.DeltaUsd, 2)
             deltaPct    = if ($_.IsNew -or $null -eq $_.DeltaPct -or [double]$_.DeltaPct -lt 0) { $null } else { [Math]::Round([double]$_.DeltaPct, 1) }
             isNew       = [bool]$_.IsNew
-            resolved    = [bool]$_.Resolved
+            resolved    = ($state -eq 'resolved')
+            # open | decreasing | resolved — judged on the latest settled days, not the period total.
+            state       = $state
+            # The latest settled days' level on the same footing as currentUsd (per period).
+            currentRunRateUsd = if ($null -ne $currentDaily -and $days -gt 0) { [Math]::Round($currentDaily * $days, 2) } else { $null }
+            # What is STILL being overspent per period: the current level above the typical one.
+            # A falling change is ranked on this, not on the period's peak.
+            currentExcessUsd = if ($null -ne $currentDaily -and $days -gt 0) { [Math]::Round([Math]::Max(0, $currentDaily * $days - [double]$_.BaselineUsd), 2) } else { $null }
+            currentAsOf = if ($_.CurrentAsOf) { [string]$_.CurrentAsOf } else { $null }
+            # How far the daily cost has fallen (negative %), since fallSince (null = against the
+            # period's average day).
+            fallPct     = if ($null -ne $_.FallPct -and [double]$_.FallPct -lt 0) { [double]$_.FallPct } else { $null }
+            fallSince   = if ($_.FallSince) { [string]$_.FallSince } else { $null }
             explained   = $explained
             cause       = if ($explained) { [string]$_.Cause } else { $null }
             facts       = @(Get-BriefFacts -EvidenceJson ([string]$_.EvidenceJson))
@@ -208,8 +231,8 @@ function Get-BriefChanges {
         period      = [string]$pointer.Period
         periodStart = [string]$pointer.PeriodStart
         periodEnd   = [string]$pointer.PeriodEnd
-        total       = @($rows | Where-Object { -not [bool]$_.Resolved }).Count
-        resolved    = @($rows | Where-Object { [bool]$_.Resolved }).Count
+        total       = @($rows | Where-Object { (& $stateOf $_) -ne 'resolved' }).Count
+        resolved    = @($rows | Where-Object { (& $stateOf $_) -eq 'resolved' }).Count
         items       = $items
     }
 }

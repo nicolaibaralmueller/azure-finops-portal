@@ -111,6 +111,15 @@ Test-That 'without a scope everything is visible (today''s behaviour)' {
     Assert-Equal 2 @((Read-Body (Invoke-HttpFunction -Name 'GetRecommendations')).recommendations).Count 'advisor'
     Assert-Equal 2 (Read-Body (Invoke-HttpFunction -Name 'GetCostSpikes' -Query @{ periodType = 'week' })).count 'changes'
 }
+Test-That 'a link to an exact period serves that period (Overview -> Cost changes)' {
+    Initialize-ReadStore
+    $ch = Read-Body (Invoke-HttpFunction -Name 'GetCostSpikes' -Query @{ periodType = 'week'; key = '2026-09-15'; offset = '3' })
+    Assert-Equal '2026-09-15' $ch.period 'the key wins over offset'
+    Assert-Equal '2026-09-09' $ch.periodStart 'a 7-day window ending on the key'
+    Assert-Equal 2 $ch.count 'its findings'
+    $bad = Read-Body (Invoke-HttpFunction -Name 'GetCostSpikes' -Query @{ periodType = 'week'; key = "2026-09-15' or 1 eq 1" })
+    Assert-True ($bad.period -ne "2026-09-15' or 1 eq 1") 'a malformed key is ignored'
+}
 Test-That 'excluding a subscription hides its rows at once, everywhere' {
     Initialize-ReadStore
     Set-Scope @($subA)

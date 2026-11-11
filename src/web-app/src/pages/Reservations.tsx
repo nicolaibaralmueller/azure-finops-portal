@@ -86,7 +86,20 @@ const showLabel = (k: Show) => (k === 'under' ? t.res.show.under(UNDER) : t.res.
 const isEnded = (i: ReservationItem, inventoryRead: boolean) =>
   i.status === 'cancelled' || i.status === 'expired' || (i.status === 'unknown' && inventoryRead)
 const endedLabel = (i: ReservationItem) => (i.status === 'cancelled' ? t.res.cancelled : i.status === 'expired' ? t.res.expired : t.res.notListed)
-const isIdle = (i: ReservationItem) => i.hasUsageData && (i.used7dUsd ?? 0) === 0 && (i.status === 'active' || i.status === 'unknown')
+// Nothing used it in the last 7 days. Judged on usage (hours / units), not on the covered cost:
+// some tenants get 0 for that cost while the usage is real, which made every reservation "idle".
+// Data synced before the quantities were stored falls back to the last day it was used.
+const usedRecently = (i: ReservationItem, lastSynced: string | null | undefined) => {
+  if (i.quantity7d != null) return i.quantity7d > 0 || (i.used7dUsd ?? 0) > 0
+  if ((i.used7dUsd ?? 0) > 0) return true
+  if (!i.lastUsed) return false
+  const synced = lastSynced ? new Date(lastSynced) : new Date()
+  // The window ends the day before the sync and spans 7 days.
+  const from = new Date(Date.UTC(synced.getUTCFullYear(), synced.getUTCMonth(), synced.getUTCDate() - 7))
+  return i.lastUsed >= from.toISOString().slice(0, 10)
+}
+const isIdle = (i: ReservationItem, lastSynced?: string | null) =>
+  i.hasUsageData && !usedRecently(i, lastSynced) && (i.status === 'active' || i.status === 'unknown')
 const what = (i: ReservationItem) =>
   i.commitment?.amount != null
     ? `${i.commitment.amount} ${i.commitment.currency}/${i.commitment.grain === 'Hourly' ? t.commit.perHour : i.commitment.grain}`
@@ -116,7 +129,7 @@ export function Reservations() {
       if (status === 'ended' && !isEnded(i, inventoryRead)) return false
       if (show === 'under' && !(i.utilisation30d != null && i.utilisation30d < UNDER)) return false
       if (show === 'expiring' && !i.expiringSoon) return false
-      if (show === 'idle' && !isIdle(i)) return false
+      if (show === 'idle' && !isIdle(i, data?.lastSynced)) return false
       if (q && ![i.name, i.sku, i.location, i.id, ...i.resources.map((r) => r.name)].some((s) => (s ?? '').toLowerCase().includes(q))) return false
       return true
     })
@@ -141,7 +154,7 @@ export function Reservations() {
   const unusedKnown = items.some((i) => i.unused30dUsd != null)
   const unusedTotal = items.reduce((s, i) => s + (i.unused30dUsd ?? 0), 0)
   const expiring = items.filter((i) => i.expiringSoon).length
-  const idle = items.filter(isIdle).length
+  const idle = items.filter((i) => isIdle(i, data?.lastSynced)).length
 
   const csv: CsvColumn<ReservationItem>[] = [
     { header: t.res.csv.name, value: (i) => i.name },
@@ -237,7 +250,7 @@ export function Reservations() {
                       <Text size={200} className={i.utilisation30d == null ? styles.muted : i.utilisation30d < UNDER ? styles.warn : styles.good}>{pct(i.utilisation30d)}</Text>
                     </TableCell>
                     <TableCell className={styles.numCol}>
-                      <Text size={200} className={isIdle(i) ? styles.warn : undefined}>{i.hasUsageData ? i.resourceCount : '—'}</Text>
+                      <Text size={200} className={isIdle(i, data.lastSynced) ? styles.warn : undefined}>{i.hasUsageData ? i.resourceCount : '—'}</Text>
                     </TableCell>
                     <TableCell className={styles.numCol}>
                       <Text size={200} className={(i.unused30dUsd ?? 0) > 0 ? styles.warn : styles.muted}>{i.unused30dUsd == null ? '—' : money(i.unused30dUsd)}</Text>
@@ -251,7 +264,7 @@ export function Reservations() {
                   {open && (
                     <TableRow>
                       <TableCell colSpan={10} style={{ padding: 0 }}>
-                        <Detail item={i} days={data.days} />
+                        <Detail item={i} days={data.days} lastSynced={data.lastSynced} />
                       </TableCell>
                     </TableRow>
                   )}
@@ -275,7 +288,7 @@ export function Reservations() {
   )
 }
 
-function Detail({ item: i, days }: { item: ReservationItem; days: number }) {
+function Detail({ item: i, days, lastSynced }: { item: ReservationItem; days: number; lastSynced?: string | null }) {
   const styles = useStyles()
   const { money } = useCurrency()
   const summary =
@@ -293,7 +306,8 @@ function Detail({ item: i, days }: { item: ReservationItem; days: number }) {
         />
       </div>
       {!i.hasUsageData && <Text size={200} className={styles.muted}>{t.res.noUsage}</Text>}
-      {isIdle(i) && (
+      {i.costHidden && <Text size={200} className={styles.muted}>{t.res.costHidden}</Text>}
+      {isIdle(i, lastSynced) && (
         <span className={styles.alert}><Warning16Regular /><Text size={200}>{t.res.idleWarn(i.lastUsed)}</Text></span>
       )}
       {i.hasUsageData && (
@@ -316,7 +330,7 @@ function Detail({ item: i, days }: { item: ReservationItem; days: number }) {
                 <TableCell><Text size={200}>{r.subscriptionName || r.subscriptionId}</Text></TableCell>
                 <TableCell className={styles.numCol}><Text size={200}>{r.days}</Text></TableCell>
                 <TableCell className={styles.numCol}><Text size={200}>{r.quantity30d.toLocaleString(locale())}</Text></TableCell>
-                <TableCell className={styles.numCol}><Text size={200}>{money(r.cost30dUsd)}</Text></TableCell>
+                <TableCell className={styles.numCol}><Text size={200} className={i.costHidden ? styles.muted : undefined}>{i.costHidden ? '—' : money(r.cost30dUsd)}</Text></TableCell>
                 <TableCell className={styles.numCol}><Text size={200}>{r.sharePct.toFixed(0)}%</Text></TableCell>
                 <TableCell><Text size={200} className={styles.muted}>{r.lastUsed ?? '—'}</Text></TableCell>
               </TableRow>
@@ -325,7 +339,7 @@ function Detail({ item: i, days }: { item: ReservationItem; days: number }) {
               <TableRow>
                 <TableCell><Text size={200} className={styles.muted}>{t.res.outsideScope(i.otherSubscriptions.count)}</Text></TableCell>
                 <TableCell /><TableCell /><TableCell />
-                <TableCell className={styles.numCol}><Text size={200}>{money(i.otherSubscriptions.cost30dUsd)}</Text></TableCell>
+                <TableCell className={styles.numCol}><Text size={200}>{i.costHidden ? '—' : money(i.otherSubscriptions.cost30dUsd)}</Text></TableCell>
                 <TableCell className={styles.numCol}><Text size={200}>{i.otherSubscriptions.sharePct.toFixed(0)}%</Text></TableCell>
                 <TableCell />
               </TableRow>

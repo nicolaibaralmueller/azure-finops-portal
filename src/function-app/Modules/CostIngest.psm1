@@ -153,6 +153,33 @@ function Write-CostSnapshotRows {
     Set-TableEntityBatch -Table 'CostSnapshots' -Entities @($entities) -Token $StorageToken
 }
 
+# Per-category day totals (Read-DailyResourceCost CategoryRows), in their OWN partition of
+# CostSnapshots: 'cat|yyyy-MM-dd'. Every reader of the per-resource rows asks for the plain day
+# partition, so these can never be summed in with them; only the meter grain of cost-change
+# detection reads them (DetectCostSpikes-Timer). A separate partition rather than a new table
+# keeps a code-only deploy working.
+function Get-CategoryPartitionKey { param([string]$Day) return "cat|$Day" }
+
+function Write-CostCategoryRows {
+    param([array]$Rows, [Parameter(Mandatory)][string]$StorageToken)
+    $entities = foreach ($r in @($Rows)) {
+        if ($null -eq $r) { continue }
+        @{
+            PartitionKey = (Get-CategoryPartitionKey -Day ([string]$r.Date))
+            # Category names repeat across subscriptions, so the subscription is in the key.
+            RowKey       = (Get-ShortHash -Value "$($r.Scope)|$($r.Meter)")
+            Kind         = 'category'
+            Date         = [string]$r.Date
+            DimensionKey = (Get-DimensionKey -Dimension 'meter' -Scope ([string]$r.Scope) -Meter ([string]$r.Meter))
+            Scope        = [string]$r.Scope
+            ResourceId   = ''
+            Meter        = [string]$r.Meter
+            CostUsd      = [Math]::Round([double]$r.CostUsd, 4)
+        }
+    }
+    if (@($entities).Count) { Set-TableEntityBatch -Table 'CostSnapshots' -Entities @($entities) -Token $StorageToken }
+}
+
 # One 'dailysub' row per day in [From, To]. A settled day (<= D-2) Azure returned nothing for is
 # a genuine zero and is written as one, so a quiet subscription never blocks the tenant total; a
 # recent day with no row yet is left out (Azure may simply not have reported it).
@@ -331,6 +358,7 @@ function Invoke-RecentCostTask {
     try {
         $r = Get-SubscriptionDailyCost -SubscriptionId $Task.subId -MgmtToken $MgmtToken -From $from -To $to -CostType ([string]$run.CostType)
         Write-CostSnapshotRows -Rows $r.Rows -StorageToken $StorageToken
+        Write-CostCategoryRows -Rows $r.CategoryRows -StorageToken $StorageToken
         $days = ConvertTo-DailySubEntities -SubscriptionId ([string]$Task.subId) -Days $r.Days -From $from -To $to -Settled $w.Settled -CostType ([string]$run.CostType) -Currency $r.Currency
         Set-TableEntityBatch -Table 'CostSummary' -Entities @($days) -Token $StorageToken
         $result.Status = 'ok'; $result.Rows = @($r.Rows).Count; $result.Currency = if ($r.Currency) { [string]$r.Currency } else { '' }; $result.Error = ''
@@ -419,6 +447,17 @@ function Invoke-SnapshotRetention {
             Write-Host "Snapshot retention: deleted $removed row(s) older than $cutoff$(if ($stale.Count -ge $max) { ' (capped; the rest goes next run)' })."
         }
     } catch { Write-Host "Snapshot retention failed (non-fatal, retries next run): $($_.Exception.Message)" }
+    # The category partitions ('cat|yyyy-MM-dd') sort after every date, so the filter above never
+    # reaches them; same cutoff, their own range.
+    try {
+        $catFrom = Get-CategoryPartitionKey -Day ''
+        $catCut = Get-CategoryPartitionKey -Day $cutoff
+        $stale = @(Get-TableEntities -Table 'CostSnapshots' -Filter "PartitionKey ge '$catFrom' and PartitionKey lt '$catCut'" -Select 'PartitionKey,RowKey' -Top $max -Token $StorageToken)
+        if ($stale.Count) {
+            $removed = Remove-TableEntityBatch -Table 'CostSnapshots' -Entities $stale -Token $StorageToken
+            Write-Host "Snapshot retention: deleted $removed category row(s) older than $cutoff."
+        }
+    } catch { Write-Host "Category snapshot retention failed (non-fatal, retries next run): $($_.Exception.Message)" }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -431,6 +470,8 @@ function Invoke-SnapshotRetention {
 #   Done         months (yyyy-MM) already fetched for Pending
 #   InFlight / InFlightAt   the month task on the queue
 #   Gen          bumped on every restart, so a task from an abandoned plan is ignored
+#   CategoryTotals  the history includes the per-category day totals; absent = fetched before
+#                   they existed, so it is fetched once more
 function Update-CostHistoryPlan {
     param([Parameter(Mandatory)][string]$StorageToken, [datetime]$Today = [datetime]::UtcNow.Date)
     $w = Get-CostIngestWindow -StorageToken $StorageToken -Today $Today
@@ -446,6 +487,12 @@ function Update-CostHistoryPlan {
     if (-not $state -or [string]$state.CostType -ne $costType) {
         if ($state) { Write-Host "Cost history: cost type is now $costType (was $($state.CostType)) — refetching the history on the new basis." }
         $covered = @(); $pending = $ids; $done = @(); $gen++
+    } elseif (-not [bool]$state.CategoryTotals) {
+        # History stored before the ingest wrote per-category totals ('cat|' partitions): fetch
+        # it once more, so the meter grain compares every month on the same basis. Same queries
+        # as the first history; it runs after the nightly run, about an hour on 42 subscriptions.
+        Write-Host "Cost history: stored without per-category totals — refetching it once to add them."
+        $covered = @(); $pending = $ids; $done = @(); $gen++
     } elseif (-not $pending.Count) {
         $missing = @($ids | Where-Object { $covered -notcontains $_ })
         if ($missing.Count) {
@@ -453,10 +500,11 @@ function Update-CostHistoryPlan {
             $pending = $missing; $done = @(); $gen++
         }
     }
-    $save = @{ PartitionKey = 'backfill'; RowKey = 'history'; CostType = $costType; Gen = $gen
+    # Every history task from here on writes category totals too.
+    $save = @{ PartitionKey = 'backfill'; RowKey = 'history'; CostType = $costType; Gen = $gen; CategoryTotals = $true
                Covered = (ConvertTo-JsonList $covered); Pending = (ConvertTo-JsonList $pending); Done = (ConvertTo-JsonList $done) }
     if (-not $pending.Count) {
-        if ($state -and [string]$state.Pending -eq '[]' -and [string]$state.CostType -eq $costType) { return 'complete' }
+        if ($state -and [string]$state.Pending -eq '[]' -and [string]$state.CostType -eq $costType -and [bool]$state.CategoryTotals) { return 'complete' }
         $save.InFlight = ''; $save.Complete = $true
         Set-TableEntity -Table 'PortalConfig' -Token $StorageToken -Entity $save
         return 'complete'
@@ -504,6 +552,7 @@ function Invoke-HistoryCostTask {
 
     # Staged in memory and written only when every subscription answered (see the module header).
     $rows = [System.Collections.Generic.List[object]]::new()
+    $cats = [System.Collections.Generic.List[object]]::new()
     $days = [System.Collections.Generic.List[object]]::new()
     $failure = $null
     foreach ($sid in $pending) {
@@ -511,6 +560,7 @@ function Invoke-HistoryCostTask {
         try {
             $r = Get-SubscriptionDailyCost -SubscriptionId $sid -MgmtToken $MgmtToken -From $from -To $to -CostType $costType
             foreach ($x in @($r.Rows)) { $rows.Add($x) }
+            foreach ($x in @($r.CategoryRows)) { if ($null -ne $x) { $cats.Add($x) } }
             foreach ($x in @(ConvertTo-DailySubEntities -SubscriptionId $sid -Days $r.Days -From $from -To $to -Settled $w.Settled -CostType $costType -Currency $r.Currency)) { $days.Add($x) }
         } catch { $failure = "[$($names[$sid])] $($_.Exception.Message)"; break }
     }
@@ -529,8 +579,9 @@ function Invoke-HistoryCostTask {
     }
 
     Write-CostSnapshotRows -Rows @($rows) -StorageToken $StorageToken
+    Write-CostCategoryRows -Rows @($cats) -StorageToken $StorageToken
     Set-TableEntityBatch -Table 'CostSummary' -Entities @($days) -Token $StorageToken
-    $done = @(@(ConvertFrom-JsonList ([string]$state.Done)) + [string]$Task.month | Sort-Object -Unique)
+    $done =@(@(ConvertFrom-JsonList ([string]$state.Done)) + [string]$Task.month | Sort-Object -Unique)
     Set-TableEntity -Table 'PortalConfig' -Token $StorageToken -Entity @{ PartitionKey = 'backfill'; RowKey = 'history'
         Done = (ConvertTo-JsonList $done); InFlight = '' }
     Write-Host "Cost history $($Task.month): wrote $($rows.Count) resource row(s) and $($days.Count) day total(s) in $([int]$sw.Elapsed.TotalSeconds)s."

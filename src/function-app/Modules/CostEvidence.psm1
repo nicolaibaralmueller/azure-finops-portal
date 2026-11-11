@@ -38,7 +38,9 @@
 
 # 2: meter findings also carry subscription-level changes of the meter's provider (e.g. a
 #    Defender plan switched on or off), which no single resource's Activity Log records.
-$script:EvidenceVersion = 2
+# 3: meter findings break down by meter inside the category first (a rise spread over many
+#    resources left only noise in a per-resource table), plus a 'spread' fact.
+$script:EvidenceVersion = 3
 function Get-CostEvidenceVersion { return [int]$script:EvidenceVersion }
 
 # Meter categories whose cost is switched on and off at SUBSCRIPTION level, by a resource
@@ -135,8 +137,8 @@ function Measure-WindowTotals {
 }
 
 # Rank what moved. -Cost / -Quantity are Measure-WindowTotals outputs keyed the same way.
-# Returns { Increases; Decreases; NetDeltaUsd; GrossIncreaseUsd; CurrentUsd; BaselineUsd;
-#           VolumeUsd; RateUsd; UnsplitUsd }.
+# Returns { Increases; Decreases; NetDeltaUsd; GrossIncreaseUsd; RisingCount; TopSharePct;
+#           CurrentUsd; BaselineUsd; VolumeUsd; RateUsd; UnsplitUsd }.
 # Increases carry SharePct = their share of the GROSS increase (all rising parts together), so
 # the shares of the listed drivers can be read as "how much of the rise this explains".
 # Increases smaller than 1% of the gross increase are dropped as noise.
@@ -179,13 +181,25 @@ function Get-ChangeDrivers {
         if ($null -ne $d.VolumeUsd) { $vol += $d.VolumeUsd; $rate += $d.RateUsd; $split += $d.DeltaUsd }
     }
     $noise = [Math]::Max(0.01, $gross * 0.01)
-    foreach ($d in $all) { if ($d.DeltaUsd -gt 0 -and $gross -gt 0) { $d.SharePct = ($d.DeltaUsd / $gross) * 100 } }
+    $rising = 0; $topShare = 0.0
+    foreach ($d in $all) {
+        if ($d.DeltaUsd -gt 0 -and $gross -gt 0) {
+            $d.SharePct = ($d.DeltaUsd / $gross) * 100
+            $rising++
+            if ($d.SharePct -gt $topShare) { $topShare = $d.SharePct }
+        }
+    }
 
     return [PSCustomObject]@{
         Increases        = @($all | Where-Object { $_.DeltaUsd -ge $noise } | Sort-Object DeltaUsd -Descending | Select-Object -First $TopIncreases)
         Decreases        = @($all | Where-Object { $_.DeltaUsd -le -$noise } | Sort-Object DeltaUsd | Select-Object -First $TopDecreases)
         NetDeltaUsd      = $net
         GrossIncreaseUsd = $gross
+        # How thinly the rise is spread: how many parts rose at all, and the largest one's share.
+        # A rise spread over many parts lists few drivers (each is below the noise floor), so the
+        # page must say so instead of showing only the few that cleared it.
+        RisingCount      = $rising
+        TopSharePct      = $topShare
         CurrentUsd       = $cur
         BaselineUsd      = $base
         # Split only when at least one meter had a quantity on both sides. UnsplitUsd is the
@@ -451,9 +465,12 @@ function New-EvidenceFacts {
         $NewResources,
         $PropertyChanges,
         $ActivityChanges,
-        $OwnerTags
+        $OwnerTags,
+        # Resource drivers below this share of the rise are left out (a meter finding lists its
+        # meters first; a resource only earns a row when it carries a real part of the rise).
+        [double]$ResourceMinSharePct = 0
     )
-    $facts = [System.Collections.Generic.List[object]]::new()
+    $facts =[System.Collections.Generic.List[object]]::new()
     $add = {
         param($f)
         $f.Insert(0, 'id', "F$($facts.Count + 1)")
@@ -488,7 +505,14 @@ function New-EvidenceFacts {
         }
     }
     if ($ResourceDrivers) {
-        foreach ($d in @($ResourceDrivers.Increases | Where-Object { -not $_.IsNew } | Select-Object -First 5)) { & $driverFact $d 'resource' 'increase' }
+        foreach ($d in @($ResourceDrivers.Increases | Where-Object { -not $_.IsNew -and [double]$_.SharePct -ge $ResourceMinSharePct } | Select-Object -First 5)) { & $driverFact $d 'resource' 'increase' }
+        # A rise spread over several resources: say how many, and how big the largest part is.
+        if ([int]$ResourceDrivers.RisingCount -ge 2 -and [double]$ResourceDrivers.GrossIncreaseUsd -gt 0) {
+            & $add ([ordered]@{
+                kind = 'spread'; resourceCount = [int]$ResourceDrivers.RisingCount
+                topSharePct = (Round1 $ResourceDrivers.TopSharePct); grossIncreaseUsd = (Round2 $ResourceDrivers.GrossIncreaseUsd)
+            })
+        }
     }
     foreach ($n in @($NewResources)) {
         if ($null -eq $n) { continue }
@@ -519,7 +543,7 @@ function New-EvidenceFacts {
 #   -ResourceContext  Get-ResourceContext output (for owner tags), optional
 #   -Deadline         UTC time after which no further Azure call is started
 #
-# Query cost: resource 2 Cost Management queries, meter 1, subscription 2; plus Activity Log /
+# Query cost: resource 2 Cost Management queries, meter 2, subscription 2; plus Activity Log /
 # Resource Graph calls (a different, far less constrained API).
 # Returns a JSON-ready ordered hashtable. Never throws: failures become notes and
 # complete = $false.
@@ -628,13 +652,22 @@ function Get-CostChangeEvidence {
             } | Where-Object { $_ })
         }
         'meter' {
-            $drivers = & $step 'Resource breakdown' {
-                $costRows = Get-GroupedCostSeries @common -GroupBy 'ResourceId' -Aggregation 'CostUSD' -Filter @{ MeterCategory = @([string]$Finding.Meter) }
-                Get-ChangeDrivers -Cost (Measure-WindowTotals -Rows $costRows @bucket) -TopIncreases 8
+            # A meter-category finding exists because no single resource explains the rise, so
+            # the breakdown that answers "what moved" is by METER inside the category (e.g.
+            # Defender "Standard P2 Node" vs "Standard Node"). The resources come second: the
+            # spread, new resources, and any one resource that carries a real share.
+            $meterFilter = @{ MeterCategory = @([string]$Finding.Meter) }
+            $drivers = & $step 'Meter breakdown' {
+                $costRows = Get-GroupedCostSeries @common -GroupBy 'Meter' -Aggregation 'CostUSD' -Filter $meterFilter
+                Get-ChangeDrivers -Cost (Measure-WindowTotals -Rows $costRows @bucket) -TopIncreases 6 -TopDecreases 3
             }
-            if ($drivers) {
-                $newResources = @($drivers.Increases | Where-Object { $_.IsNew } | Select-Object -First 5)
-                $changeTargets = @($drivers.Increases | Where-Object { $_.Key -like '/subscriptions/*' } | Select-Object -First 3 | ForEach-Object { [string]$_.Key })
+            $resourceDrivers = & $step 'Resource breakdown' {
+                $costRows = Get-GroupedCostSeries @common -GroupBy 'ResourceId' -Aggregation 'CostUSD' -Filter $meterFilter
+                Get-ChangeDrivers -Cost (Measure-WindowTotals -Rows $costRows @bucket) -TopIncreases 8 -TopDecreases 0
+            }
+            if ($resourceDrivers) {
+                $newResources = @($resourceDrivers.Increases | Where-Object { $_.IsNew } | Select-Object -First 5)
+                $changeTargets = @($resourceDrivers.Increases | Where-Object { $_.Key -like '/subscriptions/*' } | Select-Object -First 3 | ForEach-Object { [string]$_.Key })
             }
         }
         'subscription' {
@@ -687,9 +720,10 @@ function Get-CostChangeEvidence {
         $ev.baselineUsd = Round2 $totals.BaselineUsd
         $ev.netDeltaUsd = Round2 $totals.NetDeltaUsd
     }
-    $driverKind = switch ($dimension) { 'resource' { 'meter' } 'meter' { 'resource' } default { 'service' } }
+    $driverKind = switch ($dimension) { 'subscription' { 'service' } default { 'meter' } }
     $ev.facts = @(New-EvidenceFacts -DriverKind $driverKind -Drivers $drivers -ResourceDrivers $resourceDrivers `
-        -NewResources $newResources -PropertyChanges $propertyChanges -ActivityChanges $activityChanges -OwnerTags $owner)
+        -NewResources $newResources -PropertyChanges $propertyChanges -ActivityChanges $activityChanges -OwnerTags $owner `
+        -ResourceMinSharePct $(if ($dimension -eq 'meter') { 10 } else { 0 }))
     $ev.complete = $complete
     $ev.notes = @($uniqueNotes.ToArray())
     return $ev
@@ -717,6 +751,14 @@ function Set-EvidenceDailyShape {
             $f.steppedDownOn = [string]$Finding.SteppedDownOn
             $f.dailyBeforeUsd = (Round2 $Finding.DailyBeforeUsd)
             $f.dailyAfterUsd = (Round2 $Finding.DailyAfterUsd)
+        }
+        # Where it stands NOW (the latest settled days, which for a closed month lie after it).
+        $cur = $Finding.PSObject.Properties['CurrentDailyUsd']
+        if ($cur -and $null -ne $cur.Value -and [string]$cur.Value -ne '' -and [double]$cur.Value -ge 0) {
+            $f.state = [string]$Finding.State
+            $f.currentDailyUsd = (Round2 $cur.Value)
+            if ($Finding.CurrentAsOf) { $f.currentAsOf = [string]$Finding.CurrentAsOf }
+            if ($f.state -eq 'resolved') { $f.resolved = $true }
         }
         $facts += [PSCustomObject]$f
     }
@@ -767,8 +809,13 @@ from billing data and the Azure change log. Fact kinds:
 - owner: owner / cost-centre tags on the resource.
 - daily-shape: how the cost moved WITHIN the period. exitRunRateUsd is the level the period
   ended at, scaled to a whole period. steppedDownOn, when present, is the day the daily cost
-  fell from about dailyBeforeUsd to about dailyAfterUsd. resolved = true means the period ended
-  back at a normal level: the total was higher, but the increase has already stopped.
+  fell from about dailyBeforeUsd to about dailyAfterUsd. resolved = true means the cost is back
+  at a normal level: the total was higher, but the increase has already stopped. state and
+  currentDailyUsd, when present, say where it stands now (as of currentAsOf): open, decreasing
+  or resolved.
+- spread: the rise is spread over resourceCount resources, the largest carrying topSharePct
+  percent of it. A low topSharePct means no single resource caused it — look at the meters and
+  at subscription-level changes instead.
 
 When a daily-shape fact says resolved, lead with that: say the cost was high early in the
 period and fell on steppedDownOn, connect it to any change recorded around that date (for

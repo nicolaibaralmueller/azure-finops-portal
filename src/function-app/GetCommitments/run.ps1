@@ -20,10 +20,23 @@ function Read-JsonList { param($Value) if (-not $Value) { return @() } try { ret
 $subScope = Get-SubscriptionScope -Token $token
 $recs = @(Read-JsonList $row.RecommendationsJson | Where-Object { Test-InSubscriptionScope -Scope $subScope -Value ([string]$_.subscriptionId) })
 
+# Names: the inventory's displayName, else the billing data's name (CostSummary
+# 'commitment-usage'), else "Reservation 1a2b3c4d" — never a bare GUID.
+$usageNames = @{}
+try {
+    foreach ($u in @(Get-TableEntities -Table 'CostSummary' -Filter "PartitionKey eq 'commitment-usage'" -Select 'BenefitId,Name' -Token $token)) {
+        if ($u.BenefitId -and $u.Name) { $usageNames[([string]$u.BenefitId).ToLowerInvariant()] = [string]$u.Name }
+    }
+} catch { Write-Host "commitment usage names read failed: $($_.Exception.Message)" }
+$inventory = @(Read-JsonList $row.InventoryJson | Where-Object { -not $_.status -or $_.status -eq 'active' } | ForEach-Object {
+    $id = ([string]$_.id).ToLowerInvariant()
+    $_ | Add-Member -NotePropertyName name -NotePropertyValue (Get-CommitmentDisplayName -Candidates @([string]$_.name, [string]$usageNames[$id]) -Id $id -Kind ([string]$_.kind)) -Force -PassThru
+})
+
 $result = [PSCustomObject]@{
     ready           = ($null -ne $row)
     # Active ones only here; the Reservations page lists cancelled and expired ones too.
-    inventory       = @(Read-JsonList $row.InventoryJson | Where-Object { -not $_.status -or $_.status -eq 'active' })
+    inventory       = $inventory
     recommendations = $recs
     notes           = @(Read-JsonList $row.NotesJson)
     lastSynced      = if ($row) { [string]$row.SyncedAt } else { $null }

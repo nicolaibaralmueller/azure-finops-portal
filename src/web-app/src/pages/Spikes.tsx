@@ -6,6 +6,7 @@ import {
   Option,
   Button,
   Spinner,
+  Switch,
   Tab,
   TabList,
   makeStyles,
@@ -33,6 +34,7 @@ import {
   type CostSpike,
   type CostSpikesResponse,
   type ExplainSpikeResponse,
+  type FindingState,
   type PeriodType,
   type SavingsFinding,
 } from '../api/client'
@@ -155,6 +157,16 @@ const useStyles = makeStyles({
     ...shorthands.border('1px', 'solid', tokens.colorNeutralStroke2),
     ...shorthands.borderRadius(tokens.borderRadiusLarge),
   },
+  method: {
+    display: 'flex',
+    flexDirection: 'column',
+    rowGap: tokens.spacingVerticalXS,
+    ...shorthands.padding(tokens.spacingVerticalM, tokens.spacingHorizontalL),
+    backgroundColor: tokens.colorNeutralBackground1,
+    ...shorthands.border('1px', 'solid', tokens.colorNeutralStroke2),
+    ...shorthands.borderRadius(tokens.borderRadiusLarge),
+  },
+  methodBar: { display: 'flex', alignItems: 'center', columnGap: tokens.spacingHorizontalS, flexWrap: 'wrap' },
 })
 
 function Figure({ label, children }: { label: string; children: React.ReactNode }) {
@@ -172,6 +184,69 @@ function dayLabel(iso: string): string {
   const d = new Date(`${iso}T00:00:00Z`)
   if (Number.isNaN(d.getTime())) return iso
   return new Intl.DateTimeFormat(locale(), { day: 'numeric', month: 'short', timeZone: 'UTC' }).format(d)
+}
+
+// '2026-10-01' -> 'October 2026' / 'oktober 2026'.
+function monthLabel(iso: string): string {
+  const d = new Date(`${iso}T00:00:00Z`)
+  if (Number.isNaN(d.getTime())) return iso
+  return new Intl.DateTimeFormat(locale(), { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(d)
+}
+
+// Where a finding stands now. Rows written before `state` existed only carry `resolved`.
+function stateOf(s: CostSpike): FindingState {
+  return s.state ?? (s.resolved ? 'resolved' : 'open')
+}
+
+// The "how is this calculated" text, filled in from the response so every date is the real one.
+function MethodPanel({ meta, money }: { meta: CostSpikesResponse; money: (n: number) => string }) {
+  const styles = useStyles()
+  const week = meta.periodType === 'week'
+  const ranges = (meta.baselineRanges ?? [])
+    .map((r) => (week ? `${dayLabel(r.start)}–${dayLabel(r.end)}` : monthLabel(r.start)))
+    .join(', ')
+  const settled = meta.settledThrough ?? meta.periodEnd ?? ''
+  const lines: string[] = [
+    week
+      ? t.spikes.how.periodWeek(periodLabel(meta), settled ? dayLabel(settled) : '—', meta.settlingDays ?? 2)
+      : t.spikes.how.periodMonth(periodLabel(meta)),
+    t.spikes.how.compared(meta.baselineCount ?? (week ? 4 : 3), week, ranges),
+  ]
+  if (meta.minDeltaUsd != null && meta.minDeltaPct != null) lines.push(t.spikes.how.bar(money(meta.minDeltaUsd), week, meta.minDeltaPct))
+  if (meta.settledThrough) lines.push(t.spikes.how.current(3, dayLabel(meta.settledThrough)))
+  lines.push(t.spikes.how.resolves, t.spikes.how.baseline(week), t.spikes.how.removed(week))
+  if (meta.analyzedAt) {
+    const at = new Date(meta.analyzedAt)
+    if (!Number.isNaN(at.getTime())) {
+      lines.push(t.spikes.how.analysedAt(new Intl.DateTimeFormat(locale(), { dateStyle: 'medium', timeStyle: 'short' }).format(at)))
+    }
+  }
+  return (
+    <div className={styles.method}>
+      {lines.map((l, i) => {
+        // Each line is "Label: text" — bold the label.
+        const idx = l.indexOf(': ')
+        return (
+          <Text key={i} size={200}>
+            {idx > 0 && idx < 40 ? <><b>{l.slice(0, idx)}:</b>{l.slice(idx + 1)}</> : l}
+          </Text>
+        )
+      })}
+    </div>
+  )
+}
+
+// -42.3 -> '−42 %' / '-42%' in the viewer's language.
+function pctLabel(pct: number): string {
+  return new Intl.NumberFormat(locale(), { style: 'percent', maximumFractionDigits: 0, signDisplay: 'always' }).format(pct / 100)
+}
+
+// Days in a finding's period, so a daily level can be put on the same footing as the totals.
+function periodDays(s: CostSpike): number {
+  const a = new Date(`${s.periodStart}T00:00:00Z`).getTime()
+  const b = new Date(`${s.periodEnd}T00:00:00Z`).getTime()
+  if (Number.isNaN(a) || Number.isNaN(b) || b < a) return s.periodType === 'week' ? 7 : 30
+  return Math.round((b - a) / 86_400_000) + 1
 }
 
 // Why a card has no written explanation, in words.
@@ -203,8 +278,15 @@ export function Spikes() {
   const [offsetParam, setOffsetParam] = useHashParam('offset', '0')
   const periodType: PeriodType = periodParam === 'month' ? 'month' : 'week'
   const offset = Math.max(0, Math.min(24, Number(offsetParam) || 0))
-  const setPeriodType = (p: PeriodType) => setPeriodParam(p)
-  const setOffset = (fn: (o: number) => number) => setOffsetParam(String(fn(offset)))
+  // A link from the Overview names the exact period (#/changes?period=week&key=2026-11-08&focus=<id>):
+  // the brief may be days old and the weekly window has moved since. Stepping or switching grain
+  // leaves that period and goes back to "newest / earlier".
+  const [keyParam, setKeyParam] = useHashParam('key', '')
+  const [focusParam, setFocusParam] = useHashParam('focus', '')
+  const [flash, setFlash] = useState('')
+  const leaveLinked = () => { if (keyParam) setKeyParam(''); if (focusParam) setFocusParam('') }
+  const setPeriodType = (p: PeriodType) => { leaveLinked(); setPeriodParam(p) }
+  const setOffset = (fn: (o: number) => number) => { leaveLinked(); setOffsetParam(String(fn(keyParam ? 0 : offset))) }
   // Owner filter (#/changes?owner=alice). Rollups (meter, subscription) have no single owner.
   const [ownerParam, setOwnerParam] = useHashParam('owner', '')
   // Per-finding UI state.
@@ -224,11 +306,22 @@ export function Spikes() {
   useEffect(() => {
     setLoading(true)
     setError(null)
-    FinOpsApi.getCostSpikes(periodType, offset)
+    FinOpsApi.getCostSpikes(periodType, offset, keyParam || undefined)
       .then((r) => { setSpikes(r.spikes); setMeta(r) })
       .catch((e) => setError(e))
       .finally(() => setLoading(false))
-  }, [periodType, offset])
+  }, [periodType, offset, keyParam])
+
+  // Scroll to the linked finding and highlight it for a moment.
+  useEffect(() => {
+    if (loading || !focusParam) return
+    const el = document.getElementById(`spike-${focusParam}`)
+    if (!el) return
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    setFlash(focusParam)
+    const timer = setTimeout(() => setFlash(''), 4000)
+    return () => clearTimeout(timer)
+  }, [loading, focusParam, spikes])
 
   const applyResult = (id: string, r: Partial<ExplainSpikeResponse>) => {
     setSpikes((prev) =>
@@ -279,9 +372,17 @@ export function Spikes() {
     for (const s of spikes) { const k = ownerKey(s.allocation); counts.set(k, (counts.get(k) ?? 0) + 1) }
     return [...counts.entries()].sort((a, b) => a[0].localeCompare(b[0], locale()))
   }, [spikes])
+  // #/changes?hideResolved=1 — increases that have already fallen back are kept by default
+  // (the period did cost more), greyed and last.
+  const [hideResolvedParam, setHideResolvedParam] = useHashParam('hideResolved', '')
+  const hideResolved = hideResolvedParam === '1'
+  const [methodOpen, setMethodOpen] = useState(false)
+  const resolvedCount = useMemo(() => spikes.filter((s) => stateOf(s) === 'resolved').length, [spikes])
   const shown = useMemo(
-    () => (ownerParam ? spikes.filter((s) => ownerKey(s.allocation) === ownerParam) : spikes),
-    [spikes, ownerParam],
+    () => spikes
+      .filter((s) => !ownerParam || ownerKey(s.allocation) === ownerParam)
+      .filter((s) => !hideResolved || stateOf(s) !== 'resolved' || s.id === focusParam),
+    [spikes, ownerParam, hideResolved, focusParam],
   )
 
   // A short list isn't evidence that detection is broken — it usually means one thing cleared
@@ -342,7 +443,12 @@ export function Spikes() {
           { header: t.spikes.csv.increase(code), value: (s) => convert(s.deltaUsd) },
           { header: t.spikes.csv.increasePct, value: (s) => s.deltaPct },
           { header: t.spikes.csv.newSpend, value: (s) => s.isNew },
-          { header: t.spikes.csv.alreadyFell, value: (s) => !!s.resolved },
+          { header: t.spikes.csv.alreadyFell, value: (s) => stateOf(s) === 'resolved' },
+          { header: t.spikes.csv.state, value: (s) => stateOf(s) },
+          { header: t.spikes.csv.currentLevel(code), value: (s) => (s.currentDailyUsd != null ? convert(s.currentDailyUsd * periodDays(s)) : '') },
+          { header: t.spikes.csv.currentAsOf, value: (s) => s.currentAsOf ?? '' },
+          { header: t.spikes.csv.fallPct, value: (s) => s.fallPct ?? '' },
+          { header: t.spikes.csv.fallSince, value: (s) => s.fallSince ?? '' },
           { header: t.spikes.csv.endLevel(code), value: (s) => (s.exitRunRateUsd != null ? convert(s.exitRunRateUsd) : '') },
           { header: t.spikes.csv.drove, value: (s) => evidenceSummary(s.evidence) ?? '' },
           { header: t.spikes.csv.explanation, value: (s) => (s.headline ? `${s.headline}. ${s.cause ?? ''}` : '') },
@@ -384,9 +490,46 @@ export function Spikes() {
     </Text>
   ) : null
 
+  const focusMissing = !!focusParam && !spikes.some((s) => s.id === focusParam)
+  const method = !loading && !error && meta?.period ? (
+    <>
+      {keyParam && (
+        <div className={styles.methodBar}>
+          <Text size={200} className={styles.muted}>
+            {t.spikes.linkedPeriod(periodLabel(meta))}{focusMissing ? ` ${t.spikes.linkedMissing}` : ''}
+          </Text>
+          <Button size="small" appearance="transparent" onClick={() => { leaveLinked(); setOffsetParam('0') }}>
+            {t.spikes.showNewest}
+          </Button>
+        </div>
+      )}
+      <div className={styles.methodBar}>
+        <Button
+          size="small"
+          appearance="subtle"
+          icon={<Info16Regular />}
+          aria-expanded={methodOpen}
+          onClick={() => setMethodOpen((o) => !o)}
+        >
+          {t.spikes.howTitle} {methodOpen ? <ChevronUp16Regular /> : <ChevronDown16Regular />}
+        </Button>
+        <div className={styles.spacer} />
+        {resolvedCount > 0 && (
+          <Switch
+            checked={hideResolved}
+            onChange={(_e, d) => setHideResolvedParam(d.checked ? '1' : '')}
+            label={`${t.spikes.hideResolved} (${resolvedCount})`}
+          />
+        )}
+      </div>
+      {methodOpen && <MethodPanel meta={meta} money={money} />}
+    </>
+  ) : null
+
   return (
     <div className={styles.root}>
       {picker}
+      {method}
       {body}
       {!loading && !error && ownerParam && shown.length === 0 && spikes.length > 0 && (
         <Text className={styles.muted}>{t.spikes.noneForOwner(periodLabel(meta), ownerParam)}</Text>
@@ -406,15 +549,32 @@ export function Spikes() {
         const legacyText = !!s.headline && !hasEvidence
         const isOpen = open[s.id] ?? false
         const summary = evidenceSummary(s.evidence)
-        const resolved = !!s.resolved
+        const state = stateOf(s)
+        const resolved = state === 'resolved'
+        // Resolved and decreasing findings are both "not getting worse": muted, not red.
+        const settling = state !== 'open'
+        const days = periodDays(s)
+        // "−42 % since 3 Nov" — how far the daily cost has fallen, from the step down (or the
+        // period's average day when there was no clear step) to the latest settled days.
+        const fallPct = s.fallPct != null && s.fallPct < 0 ? pctLabel(s.fallPct) : null
+        const fallText = fallPct
+          ? (s.fallSince ? t.spikes.fallSince(fallPct, dayLabel(s.fallSince)) : t.spikes.fallVsAverage(fallPct))
+          : null
         const thinBaseline = s.baselinePeriods != null && s.baselinePeriodsOf != null && s.baselinePeriods < s.baselinePeriodsOf
         return (
           <div
             key={s.id}
+            id={`spike-${s.id}`}
             className={styles.card}
-            style={resolved
-              ? { borderLeftColor: tokens.colorNeutralStroke1 }
-              : isRollup ? { borderLeftColor: tokens.colorPaletteDarkOrangeBorderActive } : undefined}
+            style={{
+              ...(resolved
+                ? { borderLeftColor: tokens.colorPaletteGreenBorder2, opacity: 0.85 }
+                : state === 'decreasing' ? { borderLeftColor: tokens.colorNeutralStroke1 }
+                : isRollup ? { borderLeftColor: tokens.colorPaletteDarkOrangeBorderActive } : {}),
+              // The finding a link from the Overview pointed at.
+              ...(s.id === focusParam ? { outline: `2px solid ${tokens.colorBrandStroke1}`, outlineOffset: '2px' } : {}),
+              ...(s.id === flash ? { boxShadow: tokens.shadow16, transition: 'box-shadow 0.4s' } : {}),
+            }}
           >
             <div className={styles.head}>
               {isRollup ? (
@@ -438,12 +598,20 @@ export function Spikes() {
               )}
               <div className={styles.spacer} />
               <div className={styles.headRight}>
-                <Text size={400} className={resolved ? styles.deltaResolved : styles.delta} weight="semibold">
+                <Text size={400} className={settling ? styles.deltaResolved : styles.delta} weight="semibold">
                   +{usd(s.deltaUsd)}{per}
                 </Text>
                 {resolved && (
-                  <Badge appearance="tint" color="success" title={t.spikes.alreadyFellHint}>
-                    {t.spikes.alreadyFell}{s.steppedDownOn ? ` · ${t.spikes.fellOn(dayLabel(s.steppedDownOn))}` : ''}
+                  <Badge appearance="filled" color="success" title={t.spikes.resolvedHint}>
+                    {fallText
+                      ? `${t.spikes.stateResolved} · ${fallText}`
+                      : s.steppedDownOn ? t.spikes.stateResolvedSince(dayLabel(s.steppedDownOn)) : t.spikes.stateResolved}
+                  </Badge>
+                )}
+                {state === 'decreasing' && (
+                  <Badge appearance="tint" color="informative" title={t.spikes.decreasingHint}>
+                    {t.spikes.stateDecreasing}
+                    {fallText ? ` · ${fallText}` : s.steppedDownOn ? ` · ${t.spikes.fellOn(dayLabel(s.steppedDownOn))}` : ''}
                   </Badge>
                 )}
                 {s.isNew ? (
@@ -468,6 +636,18 @@ export function Spikes() {
                 <Figure label={t.spikes.endLevel}>
                   {usd(s.exitRunRateUsd)}{per}{s.steppedDownOn ? ` (${t.spikes.fellOn(dayLabel(s.steppedDownOn))})` : ''}
                 </Figure>
+              )}
+              {s.currentDailyUsd != null && s.currentAsOf && (
+                <div title={t.spikes.currentLevelHint(3, dayLabel(s.currentAsOf))}>
+                  <Figure label={`${t.spikes.currentLevel} · ${dayLabel(s.currentAsOf)}`}>
+                    {usd(s.currentDailyUsd * days)}{per}
+                  </Figure>
+                </div>
+              )}
+              {fallPct && s.fallFromDailyUsd != null && s.currentDailyUsd != null && (
+                <div title={t.spikes.fallHint(usd(s.fallFromDailyUsd), usd(s.currentDailyUsd), s.fallSince ? dayLabel(s.fallSince) : null)}>
+                  <Figure label={t.spikes.fallLabel(s.fallSince ? dayLabel(s.fallSince) : null)}>{fallPct}</Figure>
+                </div>
               )}
               <Figure label={t.spikes.period}>{s.periodStart} → {s.periodEnd}</Figure>
             </div>
@@ -558,7 +738,8 @@ export function Spikes() {
                   periodStart: s.periodStart,
                   periodEnd: s.periodEnd,
                   summary: `Cost rose from ${s.baselineUsd.toFixed(0)} USD (typical) to ${s.spikeUsd.toFixed(0)} USD in ${s.periodStart}..${s.periodEnd}.` +
-                    (s.exitRunRateUsd != null ? ` At the end of the period it ran at ${s.exitRunRateUsd.toFixed(0)} USD per period${s.steppedDownOn ? `, after falling on ${s.steppedDownOn}` : ''}${resolved ? ' — the increase has already fallen back' : ''}.` : '') +
+                    (s.exitRunRateUsd != null ? ` At the end of the period it ran at ${s.exitRunRateUsd.toFixed(0)} USD per period${s.steppedDownOn ? `, after falling on ${s.steppedDownOn}` : ''}.` : '') +
+                    (s.currentDailyUsd != null && s.currentAsOf ? ` Over the 3 settled days to ${s.currentAsOf} it ran at ${(s.currentDailyUsd * days).toFixed(0)} USD per period (state: ${state}).` : ` State: ${state}.`) +
                     (summary ? ` Evidence: ${summary}.` : '') + (s.explained && s.cause ? ` Explanation: ${s.cause}` : ''),
                 }}
               />

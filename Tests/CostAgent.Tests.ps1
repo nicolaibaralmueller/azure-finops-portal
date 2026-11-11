@@ -45,6 +45,41 @@ Test-That 'ids, field names and USD amounts are taken out of finding text' {
     Assert-Equal 'Savings sit on resources that are deleted.' (Remove-InsightJargon 'Savings sit on resources that are (resource no longer exists).') 'placeholder in words'
     Assert-Equal 'VM costs more since 3 Sep, 8 units.' (Remove-InsightJargon 'VM costs $596 a month more since 3 Sep, 8 units.') 'dollar amount; counts and dates stay'
 }
+Test-That 'a cost change that is falling is never priority 1; one already back to normal is no finding' {
+    $m = New-PseudonymMap
+    $f = { param($Refs, [int]$Prio) [PSCustomObject]@{ priority = $Prio; title = 't'; why = 'w'; owner = ''; monthlyCost = $null; estMonthlySavings = $null
+        currency = 'USD'; action = 'a'; actionScript = ''; refs = @($Refs) } }
+    $parsed = [PSCustomObject]@{ summary = 's'; findings = @(
+        (& $f @('C-open') 1)
+        (& $f @('C-down') 1)
+        (& $f @('C-gone') 1)
+        (& $f @('C-down', 'S-x') 1)) }
+    $r = Select-InsightFindings -Parsed $parsed -AllowedText '{}' -KnownRefs @{ 'C-open' = $true; 'C-down' = $true; 'C-gone' = $true; 'S-x' = $true } -Map $m `
+        -ChangeStates @{ 'C-open' = 'open'; 'C-down' = 'decreasing'; 'C-gone' = 'resolved' }
+    $byRefs = @{}; foreach ($x in $r.findings) { $byRefs[($x.refs -join ',')] = $x }
+    Assert-Equal 3 @($r.findings).Count 'the resolved one is dropped'
+    Assert-Equal 1 $byRefs['C-open'].priority 'open keeps P1'
+    Assert-Equal 2 $byRefs['C-down'].priority 'decreasing capped at P2'
+    Assert-Equal 1 $byRefs['C-down,S-x'].priority 'a saving in the refs lifts the cap'
+
+    # Ranked on what is still overspent now, against last month's spend of 100,000.
+    $parsed = [PSCustomObject]@{ summary = 's'; findings = @((& $f @('C-big') 1), (& $f @('C-small') 1)) }
+    $r = Select-InsightFindings -Parsed $parsed -AllowedText '{}' -KnownRefs @{ 'C-big' = $true; 'C-small' = $true } -Map $m `
+        -ChangeStates @{ 'C-big' = 'decreasing'; 'C-small' = 'decreasing' } -ChangeExcess @{ 'C-big' = 5000.0; 'C-small' = 100.0 } -BaseUsd 100000
+    $byRefs = @{}; foreach ($x in $r.findings) { $byRefs[($x.refs -join ',')] = $x }
+    Assert-Equal 2 $byRefs['C-big'].priority 'still 5% overspent: P2 (never P1 while falling)'
+    Assert-Equal 3 $byRefs['C-small'].priority 'little left overspent: P3'
+
+    $rule = @(Get-RuleFindings -Payload ([PSCustomObject]@{ spend = @{ previousMonth = @{ usd = 1000 } }; savings = @{ items = @() }
+        changes = @{ items = @(
+            [PSCustomObject]@{ id = 'C-1'; name = 'dota'; deltaUsd = 500; currentUsd = 600; owner = ''; cause = $null; state = 'decreasing'; currentExcessUsd = 300 }
+            [PSCustomObject]@{ id = 'C-3'; name = 'tail'; deltaUsd = 500; currentUsd = 600; owner = ''; cause = $null; state = 'decreasing'; currentExcessUsd = 2 }
+            [PSCustomObject]@{ id = 'C-2'; name = 'gone'; deltaUsd = 900; currentUsd = 950; owner = ''; cause = $null; state = 'resolved'; resolved = $true }) } }))
+    Assert-Equal 2 $rule.Count 'no-AI findings skip a resolved change'
+    $byRef = @{}; foreach ($x in $rule) { $byRef[$x.refs[0]] = $x }
+    Assert-Equal 2 $byRef['C-1'].priority 'a large overspend still running is capped at P2'
+    Assert-Equal 3 $byRef['C-3'].priority 'almost back to normal is P3'
+}
 Test-That 'the owner is not repeated in a title' {
     $m = New-PseudonymMap; Add-Pseudonym -Map $m -Value 'jane.doe@contoso.com' -Prefix 'OWNER'
     $parsed = [PSCustomObject]@{ summary = 's'; findings = @([PSCustomObject]@{ priority = 2; title = 'VM right-size recommendation owned by OWNER_1'; why = 'w'; owner = 'OWNER_1'

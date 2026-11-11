@@ -330,8 +330,12 @@ export function Overview() {
               </div>
               <div className="fo-prio">
                 {([1, 2, 3] as const).map((k) => {
-                  const weight = prioTotal > 0 ? byPrio[k].usd : byPrio[k].n
-                  if (!weight) return null
+                  // Width follows the savings, but a priority with findings and no savings (cost
+                  // increases, e.g. P1) still gets a small segment showing its count — otherwise
+                  // it vanishes from the bar while the legend lists it.
+                  if (!byPrio[k].n && !byPrio[k].usd) return null
+                  const showsMoney = prioTotal > 0 && byPrio[k].usd > 0
+                  const weight = prioTotal > 0 ? Math.max(byPrio[k].usd, prioTotal * 0.12) : byPrio[k].n
                   return (
                     <button
                       key={k}
@@ -342,7 +346,7 @@ export function Overview() {
                       onClick={() => setFilter(filter === k ? null : k)}
                     >
                       <span>P{k}</span>
-                      <small className="fo-num">{prioTotal > 0 ? money(byPrio[k].usd) : t.ov.nFindings(byPrio[k].n)}</small>
+                      <small className="fo-num">{showsMoney ? money(byPrio[k].usd) : t.ov.nFindings(byPrio[k].n)}</small>
                     </button>
                   )
                 })}
@@ -483,14 +487,39 @@ function FindingCard({ finding: f, doc, fmt, statuses, canSetStatus, onStatus, g
       .catch((e) => setNote({ ok: false, text: e instanceof ApiError && e.serverMessage ? e.serverMessage : t.ov.statusFailed }))
   }
 
+  // The cost changes this finding rests on — directly (C-…) or through an evidence lookup.
+  const changeOf = (id: string | undefined) => (id ? p.changes.items.find((x) => x.id === id) : undefined)
+  const toolArgId = (args: string): string | undefined => {
+    try { const a = JSON.parse(args) as { id?: unknown }; return typeof a.id === 'string' ? a.id : undefined } catch { return undefined }
+  }
+  const linkedChanges = [...new Map(
+    f.refs
+      .map((r) => changeOf(r) ?? changeOf(toolArgId(doc.ai?.toolCalls?.find((c) => c.ref === r && c.tool === 'change_evidence')?.args ?? '')))
+      .filter((c): c is NonNullable<typeof c> => !!c)
+      .map((c) => [c.id, c]),
+  ).values()]
+  const changeLink = (c: (typeof p.changes.items)[number]) => (
+    <a className="fo-link" href={changeHref(c)}>{c.name}</a>
+  )
+
   const describeRef = (r: string) => {
     const tool = doc.ai?.toolCalls?.find((call) => call.ref === r)
     if (tool) {
       const name = tool.tool === 'cost_query' ? t.ov.costQuery : tool.tool === 'change_evidence' ? t.ov.changeEvidence : tool.tool === 'saving_detail' ? t.ov.savingDetail : tool.tool
+      // An evidence lookup names the change it read, linked — not its internal id.
+      if (tool.tool === 'change_evidence') {
+        const c = changeOf(toolArgId(tool.args))
+        if (c) return <>{name}: {changeLink(c)} ({tool.summary})</>
+        return <>{name} ({tool.summary})</>
+      }
+      if (tool.tool === 'saving_detail') {
+        const s = p.savings.items.find((x) => x.id === toolArgId(tool.args))
+        return <>{name}{s ? `: ${s.title}${s.resourceName ? ` (${s.resourceName})` : ''}` : ''} ({tool.summary})</>
+      }
       return <>{name} ({tool.summary})<br /><code>{tool.args}</code></>
     }
-    const c = p.changes.items.find((x) => x.id === r)
-    if (c) return <>{t.ov.costChange(c.period ?? null, c.name, c.cause ?? null)}</>
+    const c = changeOf(r)
+    if (c) return <>{t.ov.costChange(c.period ?? null, c.name, c.cause ?? null)} · {changeLink(c)}</>
     const s = p.savings.items.find((x) => x.id === r)
     if (s) return <>{s.source === 'advisor' ? t.ov.advisor : t.ov.savingsCheck}: {s.title}{s.resourceName ? ` (${s.resourceName})` : ''}</>
     const o = p.owners?.find((x) => x.id === r)
@@ -531,7 +560,10 @@ function FindingCard({ finding: f, doc, fmt, statuses, canSetStatus, onStatus, g
             </>
           )}
           {savingId && status && !canSetStatus && <span className="fo-status-label">{t.ov.statusIs(t.ov.statuses[status] ?? status)}</span>}
-          {hasChange && <button type="button" className="fo-link" onClick={() => goTo('spikes')}>{t.ov.costChanges}</button>}
+          {/* Straight to the change(s) this finding is about, in the period it was found in. */}
+          {linkedChanges.length === 1 && <a className="fo-link" href={changeHref(linkedChanges[0])}>{t.ov.costChanges}</a>}
+          {linkedChanges.length > 1 && linkedChanges.map((c) => <a key={c.id} className="fo-link" href={changeHref(c)}>{c.name}</a>)}
+          {hasChange && !linkedChanges.length && <button type="button" className="fo-link" onClick={() => goTo('spikes')}>{t.ov.costChanges}</button>}
           {hasSaving && <button type="button" className="fo-link" onClick={() => goTo('savings')}>{t.ov.savings}</button>}
           {note && <span className={note.ok ? 'fo-ok' : 'fo-err'} aria-live="polite">{note.text}</span>}
         </div>
@@ -542,6 +574,18 @@ function FindingCard({ finding: f, doc, fmt, statuses, canSetStatus, onStatus, g
       </div>
     </article>
   )
+}
+
+// A link to one cost change on the Cost changes page: the exact period the brief read it from
+// (periodKey 'week|2026-11-08' / 'month|2026-10'), scrolled to and highlighted.
+function changeHref(c: { findingId: string; periodKey?: string; period?: string }): string {
+  const params = new URLSearchParams()
+  const [grain, key] = (c.periodKey ?? '').split('|')
+  const type = grain === 'week' || grain === 'month' ? grain : c.period === 'last month' ? 'month' : 'week'
+  params.set('period', type)
+  if (key) params.set('key', key)
+  params.set('focus', c.findingId)
+  return buildHash('spikes', params)
 }
 
 function OwnerTable({ owners, findings, grainLabel }: {

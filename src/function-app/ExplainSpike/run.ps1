@@ -87,6 +87,10 @@ $finding = [PSCustomObject]@{
     Resolved       = [bool]$row.Resolved
     DailyBeforeUsd = $null
     DailyAfterUsd  = $null
+    # Where it stands now (DetectCostSpikes-Timer, Get-FindingState).
+    State           = [string]$row.State
+    CurrentDailyUsd = if ($null -ne $row.CurrentDailyUsd -and [string]$row.CurrentDailyUsd -ne '') { [double]$row.CurrentDailyUsd } else { $null }
+    CurrentAsOf     = [string]$row.CurrentAsOf
 }
 # The before/after daily levels are only kept in the stored daily-shape fact.
 if ($row.EvidenceJson) {
@@ -105,6 +109,9 @@ $evidence = $null
 $evidenceStatus = [string]$row.EvidenceStatus
 if (-not $refreshEvidence -and $row.EvidenceJson -and $evidenceStatus -eq 'complete') {
     try { $evidence = [string]$row.EvidenceJson | ConvertFrom-Json } catch { $evidence = $null }
+    # Evidence from an older version lacks what the current one collects (e.g. the meter
+    # breakdown of a meter finding): gather it again.
+    if ($evidence -and [int]$evidence.version -lt (Get-CostEvidenceVersion)) { $evidence = $null }
 }
 if (-not $evidence -and $mgmtToken) {
     # The windows detection compared against: 4 prior 7-day windows, or 3 prior months.

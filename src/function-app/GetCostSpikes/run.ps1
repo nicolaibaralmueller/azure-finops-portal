@@ -32,6 +32,15 @@ if ($q -and $q['offset']) {
 }
 $minUsd = 0.0
 if ($q -and $q['minUsd']) { [double]::TryParse([string]$q['minUsd'], [System.Globalization.NumberStyles]::Any, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$minUsd) | Out-Null }
+# ?key=<period key> serves that exact period instead of stepping back from the newest — what a
+# link from the Overview's findings needs: the brief may be days old, and the weekly window has
+# moved on since. Week keys are the window's last day (yyyy-MM-dd), month keys yyyy-MM.
+$exactKey = $null
+if ($q -and $q['key']) {
+    $k = [string]$q['key']
+    $pattern = if ($periodType -eq 'week') { '^\d{4}-\d{2}-\d{2}$' } else { '^\d{4}-\d{2}$' }
+    if ($k -match $pattern) { $exactKey = $k }
+}
 $dimFilter = if ($q -and $q['dimension']) { ([string]$q['dimension']).ToLower() } else { 'all' }
 if ($dimFilter -notin @('all', 'resource', 'meter', 'subscription')) { $dimFilter = 'all' }
 
@@ -47,7 +56,18 @@ $today = [datetime]::UtcNow.Date
 $periodKey = $null
 $bounds = $null
 
-if ($periodType -eq 'week') {
+if ($exactKey) {
+    try {
+        if ($periodType -eq 'week') {
+            $end = [datetime]::ParseExact($exactKey, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+            $periodKey = $exactKey
+            $bounds = @{ Start = $end.AddDays(-6); End = $end }
+        } else {
+            $bounds = Get-PeriodBounds -PeriodKey $exactKey -PeriodType 'month'
+            $periodKey = $exactKey
+        }
+    } catch { $periodKey = $null; $bounds = $null }
+} elseif ($periodType -eq 'week') {
     $pointer = $null
     try {
         $pointer = @(Get-TableEntities -Table 'PortalConfig' -Filter "PartitionKey eq 'latestperiod' and RowKey eq 'week'" -Token $token) | Select-Object -First 1
@@ -102,10 +122,31 @@ $rows = @(Select-InSubscriptionScope -Scope (Get-SubscriptionScope -Token $token
 # Did the detector actually run for this period? Written by DetectCostSpikes-Timer regardless
 # of whether it found anything, so "clean" and "not yet analysed" stay distinguishable.
 $analyzed = $false
+$marker = $null
 try {
-    $analyzed = @(Get-TableEntities -Table 'PortalConfig' `
-        -Filter "PartitionKey eq 'analyzed' and RowKey eq '$periodType|$periodKey'" -Token $token).Count -gt 0
+    $marker = @(Get-TableEntities -Table 'PortalConfig' `
+        -Filter "PartitionKey eq 'analyzed' and RowKey eq '$periodType|$periodKey'" -Token $token) | Select-Object -First 1
+    $analyzed = $null -ne $marker
 } catch { Write-Host "analysed-marker read failed: $($_.Exception.Message)" }
+
+# How the comparison was made, for the page's "how is this calculated" panel. Markers written
+# before this was stored get the ranges detection WOULD have used.
+$baselineCount = Get-PeriodBaselineCount -PeriodType $periodType
+$baselineRanges = @()
+if ($marker -and $marker.BaselineRangesJson) {
+    try { $baselineRanges = @([string]$marker.BaselineRangesJson | ConvertFrom-Json) } catch { $baselineRanges = @() }
+}
+if (-not $baselineRanges.Count -and $bounds) {
+    $baselineRanges = @(1..$baselineCount | ForEach-Object {
+        if ($periodType -eq 'week') {
+            $e = $bounds.End.AddDays(-7 * $_); @{ start = $e.AddDays(-6).ToString('yyyy-MM-dd'); end = $e.ToString('yyyy-MM-dd') }
+        } else {
+            $s = $bounds.Start.AddMonths(-$_); @{ start = $s.ToString('yyyy-MM-dd'); end = $s.AddMonths(1).AddDays(-1).ToString('yyyy-MM-dd') }
+        }
+    } | Sort-Object { $_.start })
+}
+$settledThrough = if ($marker -and $marker.SettledThrough) { [string]$marker.SettledThrough } else { $null }
+$analyzedAt = if ($marker -and $marker.At) { [string]$marker.At } else { $null }
 # Rows without a marker mean the period predates the marker being introduced — findings exist,
 # so it plainly was analysed.
 if (-not $analyzed -and $rows.Count -gt 0) { $analyzed = $true }
@@ -174,6 +215,16 @@ $spikes = foreach ($r in $rows) {
         resolved       = [bool]$r.Resolved
         exitRunRateUsd = if ($null -ne $r.ExitRunRateUsd -and [double]$r.ExitRunRateUsd -ge 0) { [double]$r.ExitRunRateUsd } else { $null }
         steppedDownOn  = if ($r.SteppedDownOn) { [string]$r.SteppedDownOn } else { $null }
+        # Where it stands now: open | decreasing | resolved (rows from before this existed derive
+        # it from the month-end flag).
+        state          = if ($r.State) { [string]$r.State } elseif ([bool]$r.Resolved) { 'resolved' } else { 'open' }
+        currentDailyUsd = if ($null -ne $r.CurrentDailyUsd -and [double]$r.CurrentDailyUsd -ge 0) { [double]$r.CurrentDailyUsd } else { $null }
+        currentAsOf    = if ($r.CurrentAsOf) { [string]$r.CurrentAsOf } else { $null }
+        # How far the daily cost has fallen (negative %), from fallFromDailyUsd, since fallSince
+        # (null = against the period's average day). null = no fall measured.
+        fallPct        = if ($null -ne $r.FallPct -and [double]$r.FallPct -lt 0) { [double]$r.FallPct } else { $null }
+        fallFromDailyUsd = if ($null -ne $r.FallFromDailyUsd -and [double]$r.FallFromDailyUsd -ge 0) { [double]$r.FallFromDailyUsd } else { $null }
+        fallSince      = if ($r.FallSince) { [string]$r.FallSince } else { $null }
         baselinePeriods   = if ($null -ne $r.BaselinePeriods -and [int]$r.BaselinePeriods -ge 0) { [int]$r.BaselinePeriods } else { $null }
         baselinePeriodsOf = if ($null -ne $r.BaselinePeriodsOf -and [int]$r.BaselinePeriodsOf -ge 0) { [int]$r.BaselinePeriodsOf } else { $null }
         # Written explanation (AI, from the evidence). Rows written before the evidence rework
@@ -193,8 +244,9 @@ $spikes = foreach ($r in $rows) {
         detectedAt     = $r.DetectedAt
     }
 }
-# Open increases first; ones that already fell back during the period go last.
-$spikes = @($spikes | Sort-Object -Property @{ Expression = { [bool]$_.resolved } }, @{ Expression = 'deltaUsd'; Descending = $true })
+# Open increases first, then decreasing ones; ones that have already fallen back go last.
+$stateRank = @{ open = 0; decreasing = 1; resolved = 2 }
+$spikes = @($spikes | Sort-Object -Property @{ Expression = { $stateRank[[string]$_.state] } }, @{ Expression = 'deltaUsd'; Descending = $true })
 
 Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
     StatusCode = [HttpStatusCode]::OK
@@ -216,6 +268,13 @@ Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         # short list reads as "nothing else moved this much" rather than "something is broken".
         minDeltaUsd = $minDeltaUsd
         minDeltaPct = $minDeltaPct
+        # How the comparison was made: the windows/months whose MEDIAN is the typical level, how
+        # many there are, the newest settled day the "current level" uses, and when it ran.
+        baselineRanges = @($baselineRanges)
+        baselineCount  = $baselineCount
+        settlingDays   = ([datetime]::UtcNow.Date - (Get-RollingWindowEndDate)).Days
+        settledThrough = $settledThrough
+        analyzedAt     = $analyzedAt
     } | ConvertTo-Json -Depth 12)
     Headers    = @{ "Content-Type" = "application/json" }
 })
